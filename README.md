@@ -16,7 +16,7 @@ test suite is executed end-to-end and a dedicated Git commit is produced.
 | 1 | Cryptographic primitives & verification against DSTU test vectors | implemented |
 | 2 | Secure handshake protocol (mutual auth + key agreement) | implemented |
 | 3 | Attack mitigation (sliding replay window, timestamp validation, MITM) | implemented |
-| 4 | Chunked encrypted file and photo transfer | pending |
+| 4 | Async TCP transport, multiplexed messages, chunked file/photo transfer | implemented |
 | 5 | Final polish, documentation, type hints, copyright headers | pending |
 
 ## Quick start
@@ -54,7 +54,14 @@ src/secure_channel/
     handshake.py          # SIGMA-style mutual-auth handshake
     clock.py              # Microsecond wall-clock provider abstraction
     replay_window.py      # RFC 6479-style sliding replay-window bitmap
-  network/                # (Phase 4) async framing & file transfer
+  network/
+    framing.py            # Length-prefix wire framing on asyncio streams
+    messages.py           # Application multiplex (text vs file-transfer messages)
+    handshake_io.py       # Run the SIGMA handshake over an asyncio stream pair
+    connection.py         # SecureChannelConnection wrapping reader/writer + session
+    server.py             # Async TCP secure-channel server
+    client.py             # Async TCP secure-channel client
+    file_transfer.py      # Chunked, streaming file send / receive
   utils/                  # Byte / RNG helpers
 ```
 
@@ -85,6 +92,51 @@ The Phase 3 attack-scenario test suite covers in-window replay,
 out-of-window replay, expired timestamps, future timestamps, header
 tampering of both the timestamp and the sequence number, and a number
 of boundary conditions at the freshness window edges.
+
+## Network layer (Phase 4)
+
+The Phase 4 transport package layers `asyncio` TCP streams on top of
+the secure session:
+
+```python
+from secure_channel.network.client import connect_secure_channel
+from secure_channel.network.server import SecureChannelServer
+from secure_channel.network.file_transfer import (
+    send_file_over_secure_channel,
+    receive_file_over_secure_channel,
+)
+from secure_channel.network.messages import TextMessage
+
+# Server side
+async def handle(connection):
+    while True:
+        message = await connection.receive_message()
+        ...
+
+server = SecureChannelServer(credentials=responder_credentials,
+                             connection_handler=handle)
+await server.start(host="0.0.0.0", port=12345)
+
+# Client side
+connection = await connect_secure_channel(
+    host="server.example.com", port=12345,
+    credentials=initiator_credentials,
+)
+await connection.send_message(TextMessage(text="hello"))
+await send_file_over_secure_channel(
+    connection=connection,
+    source_file_path=Path("/path/to/photo.jpg"),
+)
+```
+
+Multiplexed messages share the encrypted channel through a leading
+1-byte tag (`TextMessage`, `FileTransferBegin`, `FileTransferChunk`,
+`FileTransferEnd`). File transfers are **fully streaming** &mdash; no
+matter the file size, the sender reads a chunk, encrypts it through
+the AEAD, transmits, and moves on; the receiver decrypts and writes
+each chunk to disk before reading the next. The streaming SHA-256 is
+computed on the fly and verified against a digest sent in the closing
+`FileTransferEnd` message.
 
 ## Verified test vectors
 
