@@ -55,6 +55,10 @@ from secure_channel.crypto.dstu4145 import (
 from secure_channel.crypto.dstu4145_curves import Dstu4145DomainParameters
 from secure_channel.crypto.kalyna_aead import KalynaAeadKey
 from secure_channel.crypto.kdf import derive_keys_from_shared_secret
+from secure_channel.session.clock import (
+    MICROSECOND_WALL_CLOCK,
+    MicrosecondClock,
+)
 from secure_channel.session.key_exchange import (
     EphemeralKeyAgreementKeyPair,
     RandomBytesProvider,
@@ -63,7 +67,7 @@ from secure_channel.session.key_exchange import (
     encode_ephemeral_public_key,
     generate_ephemeral_key_pair,
 )
-from secure_channel.session.records import DirectionalKeySet
+from secure_channel.session.records import DirectionalKeySet, FreshnessPolicy
 from secure_channel.session.secure_session import (
     SESSION_ROLE_INITIATOR,
     SESSION_ROLE_RESPONDER,
@@ -263,6 +267,8 @@ class PendingInitiatorHandshake:
         "_message_one_bytes",
         "_signature_scheme",
         "_random_bytes",
+        "_sending_clock",
+        "_freshness_policy",
     )
 
     def __init__(
@@ -272,6 +278,8 @@ class PendingInitiatorHandshake:
         initiator_nonce: bytes,
         message_one_bytes: bytes,
         random_bytes: RandomBytesProvider,
+        sending_clock: MicrosecondClock,
+        freshness_policy: FreshnessPolicy | None,
     ) -> None:
         self._credentials: Final[HandshakeIdentityCredentials] = credentials
         self._ephemeral_key_pair: Final[EphemeralKeyAgreementKeyPair] = (
@@ -283,6 +291,8 @@ class PendingInitiatorHandshake:
             Dstu4145SignatureScheme(credentials.domain)
         )
         self._random_bytes: Final[RandomBytesProvider] = random_bytes
+        self._sending_clock: Final[MicrosecondClock] = sending_clock
+        self._freshness_policy: Final[FreshnessPolicy | None] = freshness_policy
 
     @property
     def message_one_bytes(self) -> bytes:
@@ -361,6 +371,8 @@ class PendingInitiatorHandshake:
             outgoing_key_set=outgoing_key_set,
             incoming_key_set=incoming_key_set,
             role=SESSION_ROLE_INITIATOR,
+            sending_clock=self._sending_clock,
+            freshness_policy=self._freshness_policy,
         )
         return message_three_bytes, secure_session
 
@@ -369,9 +381,17 @@ def initiate_handshake(
     credentials: HandshakeIdentityCredentials,
     *,
     random_bytes: RandomBytesProvider | None = None,
+    sending_clock: MicrosecondClock = MICROSECOND_WALL_CLOCK,
+    freshness_policy: FreshnessPolicy | None = None,
 ) -> PendingInitiatorHandshake:
     """Begin a handshake from the initiator side.
 
+    :param credentials: Long-term identity credentials of the initiator.
+    :param random_bytes: Source of cryptographic randomness.
+    :param sending_clock: Wall-clock provider used to stamp outgoing
+        records of the resulting :class:`SecureSession`.
+    :param freshness_policy: Receiver-side freshness and replay-window
+        configuration applied to incoming records.
     :returns: A pending state object whose
         :attr:`PendingInitiatorHandshake.message_one_bytes` attribute
         carries the bytes to transmit to the responder.
@@ -393,6 +413,8 @@ def initiate_handshake(
         initiator_nonce=initiator_nonce,
         message_one_bytes=message_one_bytes,
         random_bytes=random_source,
+        sending_clock=sending_clock,
+        freshness_policy=freshness_policy,
     )
 
 
@@ -412,6 +434,8 @@ class PendingResponderHandshake:
         "_initiator_ephemeral_public_point",
         "_responder_signature",
         "_signature_scheme",
+        "_sending_clock",
+        "_freshness_policy",
     )
 
     def __init__(
@@ -422,6 +446,8 @@ class PendingResponderHandshake:
         message_two_bytes: bytes,
         initiator_ephemeral_public_point,  # type: ignore[no-untyped-def]
         responder_signature: bytes,
+        sending_clock: MicrosecondClock,
+        freshness_policy: FreshnessPolicy | None,
     ) -> None:
         self._credentials: Final[HandshakeIdentityCredentials] = credentials
         self._ephemeral_key_pair: Final[EphemeralKeyAgreementKeyPair] = (
@@ -434,6 +460,8 @@ class PendingResponderHandshake:
         self._signature_scheme: Final[Dstu4145SignatureScheme] = (
             Dstu4145SignatureScheme(credentials.domain)
         )
+        self._sending_clock: Final[MicrosecondClock] = sending_clock
+        self._freshness_policy: Final[FreshnessPolicy | None] = freshness_policy
 
     @property
     def message_two_bytes(self) -> bytes:
@@ -485,6 +513,8 @@ class PendingResponderHandshake:
             outgoing_key_set=outgoing_key_set,
             incoming_key_set=incoming_key_set,
             role=SESSION_ROLE_RESPONDER,
+            sending_clock=self._sending_clock,
+            freshness_policy=self._freshness_policy,
         )
 
 
@@ -493,8 +523,20 @@ def respond_to_handshake(
     message_one_bytes: bytes,
     *,
     random_bytes: RandomBytesProvider | None = None,
+    sending_clock: MicrosecondClock = MICROSECOND_WALL_CLOCK,
+    freshness_policy: FreshnessPolicy | None = None,
 ) -> PendingResponderHandshake:
-    """Process ``msg1`` and prepare ``msg2`` plus the responder's pending state."""
+    """Process ``msg1`` and prepare ``msg2`` plus the responder's pending state.
+
+    :param credentials: Long-term identity credentials of the responder.
+    :param message_one_bytes: ``ClientHello`` message received from the
+        initiator over the wire.
+    :param random_bytes: Source of cryptographic randomness.
+    :param sending_clock: Wall-clock provider used to stamp outgoing
+        records of the resulting :class:`SecureSession`.
+    :param freshness_policy: Receiver-side freshness and replay-window
+        configuration applied to incoming records.
+    """
     random_source: RandomBytesProvider = random_bytes or os.urandom
     initiator_nonce, encoded_initiator_ephemeral_public_key = (
         _decode_handshake_message_one(message_one_bytes)
@@ -539,6 +581,8 @@ def respond_to_handshake(
         message_two_bytes=message_two_bytes,
         initiator_ephemeral_public_point=initiator_ephemeral_public_point,
         responder_signature=responder_signature,
+        sending_clock=sending_clock,
+        freshness_policy=freshness_policy,
     )
 
 
