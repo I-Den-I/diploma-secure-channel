@@ -15,7 +15,7 @@ test suite is executed end-to-end and a dedicated Git commit is produced.
 |-------|-------|--------|
 | 1 | Cryptographic primitives & verification against DSTU test vectors | implemented |
 | 2 | Secure handshake protocol (mutual auth + key agreement) | implemented |
-| 3 | Attack mitigation (replay, MITM) | partial (in-order replay protection only) |
+| 3 | Attack mitigation (sliding replay window, timestamp validation, MITM) | implemented |
 | 4 | Chunked encrypted file and photo transfer | pending |
 | 5 | Final polish, documentation, type hints, copyright headers | pending |
 
@@ -49,9 +49,11 @@ src/secure_channel/
     dstu4145_curves.py    # Recommended curve domain parameters
   session/
     key_exchange.py       # Ephemeral ECDH over a DSTU 4145 curve
-    records.py            # Authenticated record protocol (sequence-numbered)
+    records.py            # Authenticated record protocol with timestamp + replay window
     secure_session.py     # Bidirectional post-handshake channel
     handshake.py          # SIGMA-style mutual-auth handshake
+    clock.py              # Microsecond wall-clock provider abstraction
+    replay_window.py      # RFC 6479-style sliding replay-window bitmap
   network/                # (Phase 4) async framing & file transfer
   utils/                  # Byte / RNG helpers
 ```
@@ -69,8 +71,20 @@ The secure channel layered on top of the Phase 1 primitives uses:
 * **HKDF**-style key derivation built from Kalyna-CMAC as the PRF.
 
 The handshake is a three-message SIGMA-style exchange. Records exchanged
-afterwards include strictly monotonically increasing sequence numbers and
-a per-direction nonce, providing replay protection out of the box.
+afterwards include monotonic sequence numbers, a deterministic
+per-direction nonce, and an 8-byte microsecond timestamp. The receiver:
+
+* runs an RFC 6479-style **sliding replay-window** bitmap (default
+  64 packets) over the sequence numbers, so out-of-order delivery on
+  unreliable transports is supported without losing replay protection;
+* validates the embedded **timestamp** against its local wall clock
+  with a configurable symmetric tolerance (default ±30 s), defending
+  against delay attacks and stale-record replays.
+
+The Phase 3 attack-scenario test suite covers in-window replay,
+out-of-window replay, expired timestamps, future timestamps, header
+tampering of both the timestamp and the sequence number, and a number
+of boundary conditions at the freshness window edges.
 
 ## Verified test vectors
 

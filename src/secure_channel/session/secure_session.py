@@ -12,8 +12,14 @@ Two byte-string entry points are provided:
   plaintext record into the on-the-wire encrypted form.
 * :meth:`SecureSession.decrypt_incoming_record` --- unwrap an incoming
   encrypted record and return the plaintext, raising
-  :class:`secure_channel.crypto.kalyna_aead.AuthenticationFailed` when
-  authentication or replay-protection invariants are violated.
+  :class:`secure_channel.crypto.kalyna_aead.AuthenticationFailed` (or
+  one of its subclasses) when authentication, freshness or replay
+  invariants are violated.
+
+The freshness and replay parameters are configurable through a
+:class:`secure_channel.session.records.FreshnessPolicy` instance. The
+sender's clock is exposed separately so test code can keep the two
+clocks in lockstep.
 """
 
 from __future__ import annotations
@@ -21,8 +27,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from secure_channel.session.clock import (
+    MICROSECOND_WALL_CLOCK,
+    MicrosecondClock,
+)
 from secure_channel.session.records import (
     DirectionalKeySet,
+    FreshnessPolicy,
     ReceivingHalf,
     SendingHalf,
 )
@@ -61,6 +72,10 @@ class SecureSession:
         to verify records the remote peer transmits.
     :param role: Whether this peer played the SIGMA initiator or
         responder role during the handshake.
+    :param sending_clock: Wall-clock provider used to stamp outgoing
+        records.
+    :param freshness_policy: Receiver-side freshness and replay
+        configuration.
     """
 
     __slots__ = ("_sending_half", "_receiving_half", "_role")
@@ -70,9 +85,16 @@ class SecureSession:
         outgoing_key_set: DirectionalKeySet,
         incoming_key_set: DirectionalKeySet,
         role: SessionRole,
+        *,
+        sending_clock: MicrosecondClock = MICROSECOND_WALL_CLOCK,
+        freshness_policy: FreshnessPolicy | None = None,
     ) -> None:
-        self._sending_half: Final[SendingHalf] = SendingHalf(outgoing_key_set)
-        self._receiving_half: Final[ReceivingHalf] = ReceivingHalf(incoming_key_set)
+        self._sending_half: Final[SendingHalf] = SendingHalf(
+            outgoing_key_set, clock=sending_clock
+        )
+        self._receiving_half: Final[ReceivingHalf] = ReceivingHalf(
+            incoming_key_set, policy=freshness_policy
+        )
         self._role: Final[SessionRole] = role
 
     @property
