@@ -14,8 +14,8 @@ test suite is executed end-to-end and a dedicated Git commit is produced.
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | Cryptographic primitives & verification against DSTU test vectors | implemented |
-| 2 | Secure handshake protocol (mutual auth + key agreement) | pending |
-| 3 | Attack mitigation (replay, MITM) | pending |
+| 2 | Secure handshake protocol (mutual auth + key agreement) | implemented |
+| 3 | Attack mitigation (replay, MITM) | partial (in-order replay protection only) |
 | 4 | Chunked encrypted file and photo transfer | pending |
 | 5 | Final polish, documentation, type hints, copyright headers | pending |
 
@@ -40,14 +40,37 @@ arranged as follows:
 src/secure_channel/
   crypto/
     kalyna.py             # DSTU 7624:2014 Kalyna block cipher
+    kalyna_modes.py       # Kalyna-CTR and Kalyna-CMAC modes of operation
+    kalyna_aead.py        # Encrypt-then-MAC AEAD wrapper around Kalyna
+    kdf.py                # HKDF-style KDF using Kalyna-CMAC as PRF
     binary_field.py       # GF(2^m) polynomial-basis arithmetic
     binary_curve.py       # Elliptic curves y^2 + xy = x^3 + a x^2 + b
     dstu4145.py           # DSTU 4145-2002 signature scheme
     dstu4145_curves.py    # Recommended curve domain parameters
-  session/                # (Phase 2+) handshake & session keys
+  session/
+    key_exchange.py       # Ephemeral ECDH over a DSTU 4145 curve
+    records.py            # Authenticated record protocol (sequence-numbered)
+    secure_session.py     # Bidirectional post-handshake channel
+    handshake.py          # SIGMA-style mutual-auth handshake
   network/                # (Phase 4) async framing & file transfer
   utils/                  # Byte / RNG helpers
 ```
+
+## Cryptographic protocol
+
+The secure channel layered on top of the Phase 1 primitives uses:
+
+* **Kalyna(128, 256)** in **CTR mode** for confidentiality.
+* **Kalyna-CMAC** for integrity, composed with CTR via *Encrypt-then-MAC*.
+* **Ephemeral Diffie-Hellman** over the DSTU 4145 m=163 standard curve
+  for forward-secret key agreement.
+* **DSTU 4145-2002** long-term signatures binding each side's identity
+  to the handshake transcript (mutual authentication, MITM defence).
+* **HKDF**-style key derivation built from Kalyna-CMAC as the PRF.
+
+The handshake is a three-message SIGMA-style exchange. Records exchanged
+afterwards include strictly monotonically increasing sequence numbers and
+a per-direction nonce, providing replay protection out of the box.
 
 ## Verified test vectors
 
