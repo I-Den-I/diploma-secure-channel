@@ -111,6 +111,7 @@ class KalynaAead:
 
     @property
     def tag_byte_length(self) -> int:
+        """Length of the authentication tag emitted by :meth:`encrypt`, in bytes."""
         return self._tag_byte_length
 
     def encrypt(

@@ -13,11 +13,11 @@ test suite is executed end-to-end and a dedicated Git commit is produced.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 1 | Cryptographic primitives & verification against DSTU test vectors | implemented |
-| 2 | Secure handshake protocol (mutual auth + key agreement) | implemented |
-| 3 | Attack mitigation (sliding replay window, timestamp validation, MITM) | implemented |
-| 4 | Async TCP transport, multiplexed messages, chunked file/photo transfer | implemented |
-| 5 | Final polish, documentation, type hints, copyright headers | pending |
+| 1 | Cryptographic primitives & verification against DSTU test vectors | ✅ done |
+| 2 | Secure handshake protocol (mutual auth + key agreement) | ✅ done |
+| 3 | Attack mitigation (sliding replay window, timestamp validation, MITM) | ✅ done |
+| 4 | Async TCP transport, multiplexed messages, chunked file/photo transfer | ✅ done |
+| 5 | Final polish — copyright headers, docstrings, type hints, demo scripts, [`TESTING_GUIDE.md`](TESTING_GUIDE.md) | ✅ done |
 
 ## Quick start
 
@@ -31,6 +31,35 @@ pip install -r requirements.txt
 
 # 3. Run the full test suite (Annex A vectors + property tests).
 python -m pytest -q
+```
+
+## Real-world testing between two computers
+
+The runnable demo scripts under [`examples/`](examples/) let two human
+users (Alice and Bob, on different machines) exchange end-to-end
+encrypted text and files over the secure channel. A complete
+walkthrough — covering local-LAN, Tailscale and ngrok deployments —
+lives in **[`TESTING_GUIDE.md`](TESTING_GUIDE.md)**. The 30-second
+TL;DR:
+
+```bash
+# Once per user, on each laptop:
+python examples/generate_identity.py alice          # Alice's machine
+python examples/generate_identity.py bob            # Bob's machine
+# then exchange the public.json files out-of-band.
+
+# On Alice's machine:
+python examples/run_server.py \
+    --identity examples/identities/alice \
+    --peer     examples/identities/bob \
+    --host 0.0.0.0 --port 9000
+
+# On Bob's machine:
+python examples/run_client.py \
+    --identity examples/identities/bob \
+    --peer     examples/identities/alice \
+    --host <alice-ip-or-tailnet-or-ngrok> --port 9000
+# At the prompt: type chat lines, /sendfile <path>, /quit.
 ```
 
 The package itself lives under [src/secure_channel](src/secure_channel) and is
@@ -62,7 +91,17 @@ src/secure_channel/
     server.py             # Async TCP secure-channel server
     client.py             # Async TCP secure-channel client
     file_transfer.py      # Chunked, streaming file send / receive
-  utils/                  # Byte / RNG helpers
+  utils/                  # Reserved namespace for cross-cutting helpers
+```
+
+The runnable demo lives outside the importable package:
+
+```
+examples/
+  generate_identity.py    # One-shot DSTU 4145 key-pair generator
+  run_server.py           # Interactive responder (chat + file receive)
+  run_client.py           # Interactive initiator (chat + /sendfile)
+  _identity_io.py         # JSON persistence helpers shared by the scripts
 ```
 
 ## Cryptographic protocol
@@ -146,6 +185,20 @@ computed on the fly and verified against a digest sent in the closing
   enciphering and deciphering.
 * The DSTU 4145-2002 worked example over the standard curve over
   $GF(2^{163})$ with the deterministic nonce listed in Annex B.
+
+## Coding standards
+
+Every Python file under [`src/secure_channel`](src/secure_channel) and
+[`tests`](tests):
+
+* opens with the standard copyright header
+  `Copyright (c) 2026 Denys Nazarenko, Lviv Polytechnic National University.`;
+* carries a Sphinx-style module docstring describing its
+  cryptographic role and (where relevant) the section of DSTU 7624 or
+  DSTU 4145 it implements;
+* uses strict type hints on every public function and method;
+* documents every public class with parameter / return-value / raised
+  exception sections in a Sphinx-style docstring.
 
 ## License
 

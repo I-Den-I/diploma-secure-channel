@@ -37,3 +37,8 @@ coverage.xml
 *.swp
 *~
 .DS_Store
+
+# Demo runtime artifacts (never commit private keys or received files)
+examples/identities/
+received_files/
+incoming_from_*/
