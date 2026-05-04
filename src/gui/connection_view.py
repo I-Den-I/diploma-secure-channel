@@ -1,0 +1,538 @@
+# Copyright (c) 2026 Denys Nazarenko, Lviv Polytechnic National University.
+"""Pre-handshake connection screen.
+
+The view collects the four pieces of information that drive a SIGMA
+handshake:
+
+1. The local user's ``private.json`` (file picker).
+2. The peer's ``public.json`` (file picker).
+3. The local *role* --- "Listen as server" or "Connect as client" ---
+   selected through a segmented toggle.
+4. A host (only meaningful in client mode) and a port.
+
+Once all required inputs are valid, a primary "Connect" / "Listen"
+button kicks off the appropriate asyncio coroutine without freezing
+the Flet UI thread. On success the resulting
+:class:`SecureChannelConnection` is stashed inside the shared
+:class:`AppState` and the view router transitions the page to the
+placeholder chat screen.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Final, Optional
+
+import flet as ft
+
+from gui.app_state import AppState
+from gui.chat_view import build_chat_view
+from secure_channel.identity_io import (
+    PRIVATE_KEY_FILE_NAME,
+    PUBLIC_KEY_FILE_NAME,
+    assemble_handshake_credentials,
+)
+from secure_channel.network.client import connect_secure_channel
+from secure_channel.network.connection import SecureChannelConnection
+from secure_channel.network.server import SecureChannelServer
+from secure_channel.session.handshake import HandshakeError
+
+
+_DEFAULT_HOST_VALUE: Final[str] = "127.0.0.1"
+_DEFAULT_PORT_VALUE: Final[str] = "9000"
+_OWN_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select your private.json"
+_PEER_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select the peer's public.json"
+
+
+class ConnectionView:
+    """Top-level connection / listen screen.
+
+    :param app_state: Shared mutable runtime state.
+    """
+
+    __slots__ = (
+        "_app_state",
+        "_role_segmented_button",
+        "_host_text_field",
+        "_port_text_field",
+        "_own_private_key_path_text",
+        "_peer_public_key_path_text",
+        "_status_text",
+        "_progress_indicator",
+        "_primary_action_button",
+        "_own_file_picker",
+        "_peer_file_picker",
+        "_in_progress",
+    )
+
+    def __init__(self, app_state: AppState) -> None:
+        self._app_state: Final[AppState] = app_state
+        self._in_progress: bool = False
+
+        # Flet 0.84 exposes ``FilePicker.pick_files`` as an async method
+        # that returns the selected files directly (the older
+        # ``on_result`` callback shape was removed). One picker per slot
+        # is still convenient because it isolates state.
+        self._own_file_picker = ft.FilePicker()
+        self._peer_file_picker = ft.FilePicker()
+
+        initial_own_path: Optional[Path] = app_state.own_private_key_path
+        initial_peer_path: Optional[Path] = app_state.peer_public_key_path
+
+        self._own_private_key_path_text = ft.Text(
+            value=self._format_path_for_display(initial_own_path),
+            size=12,
+            color=ft.Colors.ON_SURFACE_VARIANT,
+            selectable=True,
+            no_wrap=False,
+        )
+        self._peer_public_key_path_text = ft.Text(
+            value=self._format_path_for_display(initial_peer_path),
+            size=12,
+            color=ft.Colors.ON_SURFACE_VARIANT,
+            selectable=True,
+            no_wrap=False,
+        )
+
+        self._role_segmented_button = ft.SegmentedButton(
+            allow_multiple_selection=False,
+            allow_empty_selection=False,
+            # ``selected`` is serialised over msgpack to the Flet front-end,
+            # which in 0.84 does not handle ``set`` instances. A plain list
+            # round-trips cleanly.
+            selected=["client"],
+            on_change=self._handle_role_change,
+            segments=[
+                ft.Segment(
+                    value="client",
+                    label=ft.Text("Connect as client"),
+                    icon=ft.Icon(ft.Icons.CALL_MADE),
+                ),
+                ft.Segment(
+                    value="server",
+                    label=ft.Text("Listen as server"),
+                    icon=ft.Icon(ft.Icons.WIFI_TETHERING),
+                ),
+            ],
+        )
+        self._host_text_field = ft.TextField(
+            label="Host",
+            value=_DEFAULT_HOST_VALUE,
+            hint_text="IP address, hostname, or 0.0.0.0 (server)",
+            expand=True,
+            prefix_icon=ft.Icons.PUBLIC,
+        )
+        self._port_text_field = ft.TextField(
+            label="Port",
+            value=_DEFAULT_PORT_VALUE,
+            hint_text="1..65535",
+            width=120,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+
+        self._status_text = ft.Text(value="", size=13, selectable=True)
+        self._progress_indicator = ft.ProgressRing(
+            visible=False, width=18, height=18, stroke_width=2
+        )
+        self._primary_action_button = ft.FilledButton(
+            content="Connect",
+            icon=ft.Icons.LOCK_OPEN,
+            on_click=self._handle_primary_action_click,
+        )
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def build(self) -> ft.Control:
+        """Compose and return the root :class:`flet.Control` of the view."""
+        # File pickers must be attached to the page overlay rather than
+        # to the main control tree so that they can pop up a native
+        # dialog regardless of the surrounding layout. ``ft.FilePicker``
+        # overrides ``__eq__``, so identity-based membership checks are
+        # required to avoid false positives.
+        existing_overlay_ids = {id(control) for control in self._app_state.page.overlay}
+        if id(self._own_file_picker) not in existing_overlay_ids:
+            self._app_state.page.overlay.append(self._own_file_picker)
+        if id(self._peer_file_picker) not in existing_overlay_ids:
+            self._app_state.page.overlay.append(self._peer_file_picker)
+
+        identity_section: ft.Control = self._build_identity_section()
+        role_section: ft.Control = self._build_role_section()
+        action_section: ft.Control = self._build_action_section()
+
+        return ft.Container(
+            expand=True,
+            alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.all(48),
+            content=ft.Column(
+                width=560,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                spacing=20,
+                controls=[
+                    self._build_header(),
+                    identity_section,
+                    role_section,
+                    action_section,
+                ],
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Section builders
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_header() -> ft.Control:
+        return ft.Column(
+            tight=True,
+            spacing=4,
+            controls=[
+                ft.Row(
+                    spacing=12,
+                    controls=[
+                        ft.Icon(
+                            icon=ft.Icons.SHIELD_OUTLINED,
+                            color=ft.Colors.PRIMARY,
+                            size=32,
+                        ),
+                        ft.Text(
+                            value="DSTU Secure Channel",
+                            size=24,
+                            weight=ft.FontWeight.W_600,
+                        ),
+                    ],
+                ),
+                ft.Text(
+                    value="Load your long-term identity, choose a role, and"
+                    " start the SIGMA handshake.",
+                    size=13,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+            ],
+        )
+
+    def _build_identity_section(self) -> ft.Control:
+        return ft.Container(
+            padding=ft.Padding.all(16),
+            border_radius=12,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+            content=ft.Column(
+                tight=True,
+                spacing=12,
+                controls=[
+                    ft.Text(
+                        value="Identity files",
+                        size=14,
+                        weight=ft.FontWeight.W_500,
+                    ),
+                    ft.Row(
+                        controls=[
+                            ft.OutlinedButton(
+                                content=f"Pick own {PRIVATE_KEY_FILE_NAME}",
+                                icon=ft.Icons.VPN_KEY,
+                                on_click=self._open_own_file_picker,
+                            ),
+                            self._own_private_key_path_text,
+                        ],
+                        spacing=12,
+                        wrap=True,
+                    ),
+                    ft.Row(
+                        controls=[
+                            ft.OutlinedButton(
+                                content=f"Pick peer's {PUBLIC_KEY_FILE_NAME}",
+                                icon=ft.Icons.PERSON_OUTLINE,
+                                on_click=self._open_peer_file_picker,
+                            ),
+                            self._peer_public_key_path_text,
+                        ],
+                        spacing=12,
+                        wrap=True,
+                    ),
+                ],
+            ),
+        )
+
+    def _build_role_section(self) -> ft.Control:
+        return ft.Container(
+            padding=ft.Padding.all(16),
+            border_radius=12,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+            content=ft.Column(
+                tight=True,
+                spacing=12,
+                controls=[
+                    ft.Text(
+                        value="Role and endpoint",
+                        size=14,
+                        weight=ft.FontWeight.W_500,
+                    ),
+                    self._role_segmented_button,
+                    ft.Row(
+                        controls=[
+                            self._host_text_field,
+                            self._port_text_field,
+                        ],
+                        spacing=12,
+                    ),
+                ],
+            ),
+        )
+
+    def _build_action_section(self) -> ft.Control:
+        return ft.Row(
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                self._primary_action_button,
+                self._progress_indicator,
+                self._status_text,
+            ],
+        )
+
+    # ------------------------------------------------------------------
+    # File-picker handlers
+    # ------------------------------------------------------------------
+
+    async def _open_own_file_picker(self, event: ft.ControlEvent) -> None:
+        """Open the native file dialog for the local user's private key."""
+        picked_files = await self._own_file_picker.pick_files(
+            allow_multiple=False,
+            dialog_title=_OWN_FILE_PICKER_DIALOG_TITLE,
+            allowed_extensions=["json"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+        )
+        chosen_path: Optional[Path] = self._extract_picked_path(picked_files)
+        if chosen_path is None:
+            return
+        self._app_state.own_private_key_path = chosen_path
+        self._own_private_key_path_text.value = self._format_path_for_display(
+            chosen_path
+        )
+        self._app_state.page.update()
+
+    async def _open_peer_file_picker(self, event: ft.ControlEvent) -> None:
+        """Open the native file dialog for the peer's public key."""
+        picked_files = await self._peer_file_picker.pick_files(
+            allow_multiple=False,
+            dialog_title=_PEER_FILE_PICKER_DIALOG_TITLE,
+            allowed_extensions=["json"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+        )
+        chosen_path: Optional[Path] = self._extract_picked_path(picked_files)
+        if chosen_path is None:
+            return
+        self._app_state.peer_public_key_path = chosen_path
+        self._peer_public_key_path_text.value = self._format_path_for_display(
+            chosen_path
+        )
+        self._app_state.page.update()
+
+    @staticmethod
+    def _extract_picked_path(picked_files: object) -> Optional[Path]:
+        """Pull a single ``Path`` out of the heterogeneous Flet 0.84 result.
+
+        Different Flet builds return either ``None``, an empty list, or
+        a list of :class:`flet.FilePickerFile`-like objects. We tolerate
+        all three so the GUI works across point releases.
+        """
+        if picked_files is None:
+            return None
+        if not isinstance(picked_files, (list, tuple)):
+            return None
+        if len(picked_files) == 0:
+            return None
+        candidate = picked_files[0]
+        candidate_path: Optional[str] = getattr(candidate, "path", None) or getattr(
+            candidate, "name", None
+        )
+        if not candidate_path:
+            return None
+        return Path(candidate_path)
+
+    # ------------------------------------------------------------------
+    # Role / button handlers
+    # ------------------------------------------------------------------
+
+    def _handle_role_change(self, event: ft.ControlEvent) -> None:
+        if self._is_server_role_selected():
+            self._primary_action_button.content = "Listen"
+            self._primary_action_button.icon = ft.Icons.WIFI_TETHERING
+            self._host_text_field.label = "Bind address"
+            if self._host_text_field.value == "127.0.0.1":
+                self._host_text_field.value = "0.0.0.0"
+        else:
+            self._primary_action_button.content = "Connect"
+            self._primary_action_button.icon = ft.Icons.LOCK_OPEN
+            self._host_text_field.label = "Host"
+            if self._host_text_field.value == "0.0.0.0":
+                self._host_text_field.value = "127.0.0.1"
+        self._app_state.page.update()
+
+    async def _handle_primary_action_click(self, event: ft.ControlEvent) -> None:
+        if self._in_progress:
+            return
+        validation_error: Optional[str] = self._validate_inputs()
+        if validation_error is not None:
+            self._show_status(validation_error, error=True)
+            return
+        try:
+            self._set_in_progress(True)
+            credentials = assemble_handshake_credentials(
+                own_private_key_path=self._app_state.own_private_key_path,  # type: ignore[arg-type]
+                peer_public_key_path=self._app_state.peer_public_key_path,  # type: ignore[arg-type]
+            )
+        except (OSError, ValueError) as load_error:
+            self._set_in_progress(False)
+            self._show_status(
+                f"Could not load identity files: {load_error}", error=True
+            )
+            return
+
+        host_value: str = self._host_text_field.value or ""
+        port_value_raw: str = self._port_text_field.value or ""
+        try:
+            port_value: int = int(port_value_raw)
+            if not (1 <= port_value <= 65535):
+                raise ValueError("port out of range")
+        except ValueError:
+            self._set_in_progress(False)
+            self._show_status(
+                f"Invalid port: {port_value_raw!r} (expected 1..65535)",
+                error=True,
+            )
+            return
+
+        try:
+            if self._is_server_role_selected():
+                self._show_status(
+                    f"Listening on {host_value}:{port_value} for an incoming peer..."
+                )
+                connection = await self._listen_and_handoff(
+                    credentials=credentials,
+                    bind_host=host_value,
+                    bind_port=port_value,
+                )
+            else:
+                self._show_status(
+                    f"Connecting to {host_value}:{port_value} ..."
+                )
+                connection = await connect_secure_channel(
+                    host=host_value,
+                    port=port_value,
+                    credentials=credentials,
+                )
+        except HandshakeError as handshake_error:
+            self._set_in_progress(False)
+            self._show_status(
+                f"Handshake rejected: {handshake_error}", error=True
+            )
+            return
+        except (OSError, asyncio.TimeoutError) as transport_error:
+            self._set_in_progress(False)
+            self._show_status(
+                f"Transport error: {transport_error}", error=True
+            )
+            return
+        except Exception as unexpected_error:  # noqa: BLE001
+            self._set_in_progress(False)
+            self._show_status(
+                f"Unexpected error: {unexpected_error}", error=True
+            )
+            return
+
+        self._app_state.secure_connection = connection
+        self._show_status(
+            f"Connection established with {connection.peer_address}.",
+            error=False,
+        )
+        self._set_in_progress(False)
+        self._app_state.render_view(build_chat_view)
+
+    # ------------------------------------------------------------------
+    # Server-side listen helper
+    # ------------------------------------------------------------------
+
+    async def _listen_and_handoff(
+        self,
+        credentials,  # type: ignore[no-untyped-def]
+        bind_host: str,
+        bind_port: int,
+    ) -> SecureChannelConnection:
+        """Start a one-shot responder and hand off the resulting connection.
+
+        The :class:`SecureChannelServer` invokes a connection handler in
+        its own task. To extract the established
+        :class:`SecureChannelConnection` and feed it to the GUI we use
+        the standard *future + event* hand-off pattern: the handler
+        sets a ``Future`` with the connection, then waits on a
+        :class:`asyncio.Event` until the chat view tells it to shut
+        down.
+        """
+        connection_ready_future: asyncio.Future[SecureChannelConnection] = (
+            asyncio.get_event_loop().create_future()
+        )
+        shutdown_event: asyncio.Event = asyncio.Event()
+
+        async def connection_handler(connection: SecureChannelConnection) -> None:
+            connection_ready_future.set_result(connection)
+            await shutdown_event.wait()
+
+        secure_server: SecureChannelServer = SecureChannelServer(
+            credentials=credentials, connection_handler=connection_handler
+        )
+        await secure_server.start(host=bind_host, port=bind_port)
+        self._app_state.secure_server = secure_server
+        self._app_state.server_shutdown_event = shutdown_event
+        return await connection_ready_future
+
+    # ------------------------------------------------------------------
+    # Small helpers
+    # ------------------------------------------------------------------
+
+    def _is_server_role_selected(self) -> bool:
+        selected = self._role_segmented_button.selected or []
+        return "server" in selected
+
+    def _validate_inputs(self) -> Optional[str]:
+        if self._app_state.own_private_key_path is None:
+            return "Please select your own private.json."
+        if self._app_state.peer_public_key_path is None:
+            return "Please select the peer's public.json."
+        if not (self._host_text_field.value or "").strip():
+            return "Please enter a host or bind address."
+        if not (self._port_text_field.value or "").strip():
+            return "Please enter a TCP port."
+        return None
+
+    def _set_in_progress(self, in_progress: bool) -> None:
+        self._in_progress = in_progress
+        self._primary_action_button.disabled = in_progress
+        self._progress_indicator.visible = in_progress
+        self._app_state.page.update()
+
+    def _show_status(self, status_message: str, *, error: bool = False) -> None:
+        self._status_text.value = status_message
+        self._status_text.color = (
+            ft.Colors.ERROR if error else ft.Colors.ON_SURFACE_VARIANT
+        )
+        self._app_state.page.update()
+
+    @staticmethod
+    def _format_path_for_display(file_path: Optional[Path]) -> str:
+        if file_path is None:
+            return "(no file selected)"
+        try:
+            return str(file_path.resolve())
+        except OSError:
+            return str(file_path)
+
+
+def build_connection_view(app_state: AppState) -> ft.Control:
+    """Convenience factory used by :func:`AppState.render_view`."""
+    return ConnectionView(app_state).build()
+
+
+__all__: Final[list[str]] = ["ConnectionView", "build_connection_view"]

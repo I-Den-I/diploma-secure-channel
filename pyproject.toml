@@ -34,6 +34,12 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.4",
 ]
+gui = [
+    "flet>=0.21,<1.0",
+]
+
+[project.scripts]
+secure-channel-gui = "gui.main:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]
