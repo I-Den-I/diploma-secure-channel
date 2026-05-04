@@ -211,6 +211,7 @@ class SendingHalf:
 
     @property
     def next_sequence_number(self) -> int:
+        """Sequence number that the next call to :meth:`encrypt_record` will use."""
         return self._next_sequence_number
 
     def encrypt_record(self, plaintext: bytes) -> bytes:

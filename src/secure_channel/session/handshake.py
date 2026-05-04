@@ -47,6 +47,7 @@ import os
 from dataclasses import dataclass
 from typing import Final
 
+from secure_channel.crypto.binary_curve import BinaryCurvePoint
 from secure_channel.crypto.dstu4145 import (
     Dstu4145PrivateKey,
     Dstu4145PublicKey,
@@ -296,6 +297,7 @@ class PendingInitiatorHandshake:
 
     @property
     def message_one_bytes(self) -> bytes:
+        """Encoded ``ClientHello`` to transmit to the responder."""
         return self._message_one_bytes
 
     def consume_message_two(
@@ -444,7 +446,7 @@ class PendingResponderHandshake:
         ephemeral_key_pair: EphemeralKeyAgreementKeyPair,
         message_one_bytes: bytes,
         message_two_bytes: bytes,
-        initiator_ephemeral_public_point,  # type: ignore[no-untyped-def]
+        initiator_ephemeral_public_point: BinaryCurvePoint,
         responder_signature: bytes,
         sending_clock: MicrosecondClock,
         freshness_policy: FreshnessPolicy | None,
@@ -465,6 +467,7 @@ class PendingResponderHandshake:
 
     @property
     def message_two_bytes(self) -> bytes:
+        """Encoded ``ServerHello`` to transmit back to the initiator."""
         return self._message_two_bytes
 
     def consume_message_three(self, message_three_bytes: bytes) -> SecureSession:
