@@ -18,6 +18,8 @@ test suite is executed end-to-end and a dedicated Git commit is produced.
 | 3 | Attack mitigation (sliding replay window, timestamp validation, MITM) | ✅ done |
 | 4 | Async TCP transport, multiplexed messages, chunked file/photo transfer | ✅ done |
 | 5 | Final polish — copyright headers, docstrings, type hints, demo scripts, [`TESTING_GUIDE.md`](TESTING_GUIDE.md) | ✅ done |
+| 6 | GUI foundation: Flet app shell, connection view, async handshake → placeholder chat view | ✅ done |
+| 7 | GUI: full chat & file-transfer interface | planned |
 
 ## Quick start
 
@@ -101,7 +103,24 @@ examples/
   generate_identity.py    # One-shot DSTU 4145 key-pair generator
   run_server.py           # Interactive responder (chat + file receive)
   run_client.py           # Interactive initiator (chat + /sendfile)
-  _identity_io.py         # JSON persistence helpers shared by the scripts
+  _identity_io.py         # Backwards-compat shim around secure_channel.identity_io
+```
+
+The Flet desktop GUI (Phase 6) lives under [`src/gui/`](src/gui):
+
+```
+src/gui/
+  main.py                 # Flet entry point + view router
+  app_state.py            # Mutable runtime state shared across views
+  connection_view.py      # Identity pickers, role toggle, host/port, async handshake
+  chat_view.py            # Placeholder post-handshake screen (Phase 7 will replace it)
+```
+
+To launch the GUI on your local machine:
+
+```bash
+pip install -r requirements.txt        # picks up the flet runtime dep
+PYTHONPATH=src python -m gui           # or: pip install -e .[gui] && secure-channel-gui
 ```
 
 ## Cryptographic protocol
