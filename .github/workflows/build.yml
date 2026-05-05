@@ -18,6 +18,7 @@ on:
 
 env:
   PYTHON_VERSION: "3.12"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-windows:
@@ -38,7 +39,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Windows app
-        run: flet build windows
+        shell: bash
+        run: yes | flet build windows
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -65,7 +67,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build macOS app
-        run: flet build macos
+        run: yes | flet build macos
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -103,7 +105,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Linux app
-        run: flet build linux
+        run: yes | flet build linux
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -136,7 +138,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Android APK
-        run: flet build apk
+        run: yes | flet build apk
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
