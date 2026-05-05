@@ -41,6 +41,20 @@ gui = [
 [project.scripts]
 secure-channel-gui = "gui.main:run"
 
+# ---------------------------------------------------------------------------
+# Flet build configuration
+# ---------------------------------------------------------------------------
+# Used by ``flet build {windows,macos,linux,apk,...}`` to populate platform-
+# specific bundle metadata. The ``org`` is the reverse-DNS package
+# identifier required by the Android APK.
+
+[tool.flet]
+org = "ua.lpnu.diploma.nazarenko"
+product = "DSTU-Messenger"
+company = "Lviv Polytechnic National University"
+copyright = "Copyright (c) 2026 Denys Nazarenko, Lviv Polytechnic National University"
+description = "Secure messenger built on DSTU 7624 (Kalyna) and DSTU 4145."
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
