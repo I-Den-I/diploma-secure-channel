@@ -9,10 +9,6 @@ responsibilities are:
 * construct the shared :class:`AppState`;
 * render the initial view (the connection screen) via the small router
   on :meth:`AppState.render_view`.
-
-A blocking :func:`run` helper at the bottom of the module powers the
-``secure-channel-gui`` console-script entry point declared in
-``pyproject.toml`` (and also makes ``python -m gui`` work).
 """
 
 from __future__ import annotations
@@ -35,15 +31,19 @@ async def main(page: ft.Page) -> None:
     :param page: The root page instance supplied by the Flet runtime.
     """
     page.title = _APP_WINDOW_TITLE
-    # Default to dark mode for the messenger aesthetic. The chat view
-    # exposes a runtime theme toggle, so the user can flip to light at
-    # any time.
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 0
     page.window.width = _APP_WINDOW_DEFAULT_WIDTH
     page.window.height = _APP_WINDOW_DEFAULT_HEIGHT
     page.window.min_width = 480
     page.window.min_height = 600
+
+    own_key_picker = ft.FilePicker()
+    peer_key_picker = ft.FilePicker()
+    
+
+    page.overlay.extend([own_key_picker, peer_key_picker])
+
 
     application_state: AppState = AppState(page=page)
 
@@ -55,23 +55,16 @@ async def main(page: ft.Page) -> None:
     page.window.on_event = shutdown_on_window_close
 
     application_state.render_view(build_connection_view)
+    
+    await page.update_async()
 
 
 def run() -> None:
-    """Launch the Flet desktop app.
-
-    Wired up to the ``secure-channel-gui`` console-script entry point in
-    ``pyproject.toml`` so that ``pip install -e .[gui]`` followed by
-    ``secure-channel-gui`` boots the application without setting
-    ``PYTHONPATH`` manually.
-
-    Uses :func:`flet.run` (the modern Flet 0.80+ entry point); falls
-    back to the deprecated :func:`flet.app` on older Flet builds.
-    """
+    """Launch the Flet desktop app."""
     if hasattr(ft, "run"):
         ft.run(main)
     else:
-        ft.app(target=main)  # pragma: no cover -- legacy Flet (<0.80)
+        ft.app(target=main)
 
 
 if __name__ == "__main__":
