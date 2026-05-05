@@ -35,7 +35,10 @@ async def main(page: ft.Page) -> None:
     :param page: The root page instance supplied by the Flet runtime.
     """
     page.title = _APP_WINDOW_TITLE
-    page.theme_mode = ft.ThemeMode.SYSTEM
+    # Default to dark mode for the messenger aesthetic. The chat view
+    # exposes a runtime theme toggle, so the user can flip to light at
+    # any time.
+    page.theme_mode = ft.ThemeMode.DARK
     page.padding = 0
     page.window.width = _APP_WINDOW_DEFAULT_WIDTH
     page.window.height = _APP_WINDOW_DEFAULT_HEIGHT

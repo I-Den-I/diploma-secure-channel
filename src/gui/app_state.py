@@ -29,6 +29,16 @@ ViewBuilder = Callable[["AppState"], ft.Control]
 """Type of a callable that builds a top-level view's root control."""
 
 
+def _default_download_directory() -> Path:
+    """Return a writable per-user directory for files received over the channel.
+
+    The convention --- ``~/DSTU-SecureChannel/received/`` --- avoids
+    clobbering ``~/Downloads`` and keeps every file produced by the
+    diploma demo under a single, easily inspectable folder.
+    """
+    return Path.home() / "DSTU-SecureChannel" / "received"
+
+
 @dataclass
 class AppState:
     """Container for runtime state shared between views.
@@ -46,6 +56,9 @@ class AppState:
     :param server_shutdown_event: Asyncio event used to keep the
         responder's connection-handler coroutine alive while the chat
         view holds the connection.
+    :param download_directory: Directory under which files received
+        through the chat view are written. Created lazily on first
+        write.
     """
 
     page: ft.Page
@@ -54,6 +67,7 @@ class AppState:
     secure_connection: Optional[SecureChannelConnection] = None
     secure_server: Optional[SecureChannelServer] = None
     server_shutdown_event: Optional[asyncio.Event] = None
+    download_directory: Path = field(default_factory=_default_download_directory)
     _current_view_builder: Optional[ViewBuilder] = field(default=None, repr=False)
 
     PAGE_TITLE: Final[str] = "DSTU Secure Channel"

@@ -19,7 +19,7 @@ test suite is executed end-to-end and a dedicated Git commit is produced.
 | 4 | Async TCP transport, multiplexed messages, chunked file/photo transfer | ✅ done |
 | 5 | Final polish — copyright headers, docstrings, type hints, demo scripts, [`TESTING_GUIDE.md`](TESTING_GUIDE.md) | ✅ done |
 | 6 | GUI foundation: Flet app shell, connection view, async handshake → placeholder chat view | ✅ done |
-| 7 | GUI: full chat & file-transfer interface | planned |
+| 7 | GUI: full chat & file-transfer interface, dark/light theme toggle, system-log console | ✅ done |
 
 ## Quick start
 
@@ -106,15 +106,29 @@ examples/
   _identity_io.py         # Backwards-compat shim around secure_channel.identity_io
 ```
 
-The Flet desktop GUI (Phase 6) lives under [`src/gui/`](src/gui):
+The Flet desktop GUI (Phases 6 & 7) lives under [`src/gui/`](src/gui):
 
 ```
 src/gui/
-  main.py                 # Flet entry point + view router
+  main.py                 # Flet entry point + view router (dark theme by default)
   app_state.py            # Mutable runtime state shared across views
   connection_view.py      # Identity pickers, role toggle, host/port, async handshake
-  chat_view.py            # Placeholder post-handshake screen (Phase 7 will replace it)
+  chat_view.py            # Full messenger: bubbles, composer, paperclip, log console
 ```
+
+The chat view ships with:
+
+* a **responsive split** (chat + crypto-log console) that stacks on
+  narrow screens via `ResponsiveRow`;
+* **dark / light theme toggle** in the header;
+* **left/right bubble layout** to distinguish peer vs. local messages;
+* a **system / crypto log console** that records handshake completion,
+  AEAD encryption / decryption events, replay-window state and
+  per-file SHA-256 verification;
+* a **paperclip attachment** that opens a `FilePicker` and streams the
+  file through the Phase 4 chunked transfer module;
+* a **background asyncio listener** for inbound records that is
+  cleanly cancelled on disconnect.
 
 To launch the GUI on your local machine:
 
