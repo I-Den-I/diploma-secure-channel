@@ -35,7 +35,7 @@ dev = [
     "ruff>=0.4",
 ]
 gui = [
-    "flet>=0.21,<1.0",
+    "flet>=0.84,<1.0",
 ]
 
 [project.scripts]
@@ -54,6 +54,32 @@ product = "DSTU-Messenger"
 company = "Lviv Polytechnic National University"
 copyright = "Copyright (c) 2026 Denys Nazarenko, Lviv Polytechnic National University"
 description = "Secure messenger built on DSTU 7624 (Kalyna) and DSTU 4145."
+
+# ---------------------------------------------------------------------------
+# Android manifest permissions
+# ---------------------------------------------------------------------------
+# The chat view's paperclip-attach UX and the receive-file path both need
+# read/write access to user-selected files. ``flet build apk`` injects
+# every key set to ``true`` here as a ``<uses-permission>`` element in
+# ``AndroidManifest.xml`` -- without these the FilePicker dialog refuses
+# to open with "unknown control: File Picker" / "permission denied"
+# errors at runtime.
+[tool.flet.android.permission]
+"android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.WRITE_EXTERNAL_STORAGE" = true
+"android.permission.MANAGE_EXTERNAL_STORAGE" = true
+
+# ---------------------------------------------------------------------------
+# macOS sandbox entitlements
+# ---------------------------------------------------------------------------
+# The macOS hardened runtime forbids file-picker dialogs unless the
+# bundle declares the user-selected read/write entitlement. The
+# ``com.apple.security.assets`` family covers the standard media
+# locations under ``~/{Movies,Music,Pictures}`` so peers can attach
+# arbitrary photos and audio files.
+[tool.flet.macos.entitlement]
+"com.apple.security.assets" = true
+"com.apple.security.files.user-selected.read-write" = true
 
 [tool.setuptools.packages.find]
 where = ["src"]

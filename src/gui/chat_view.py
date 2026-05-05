@@ -124,7 +124,6 @@ class ChatView:
         "_status_chip",
         "_logs_panel_visible",
         "_logs_visibility_button",
-        "_attach_file_picker",
         "_chat_entries",
         "_system_log_entries",
     )
@@ -214,7 +213,11 @@ class ChatView:
             tooltip="Toggle system / crypto log panel",
             on_click=self._handle_logs_visibility_toggle,
         )
-        self._attach_file_picker = ft.FilePicker()
+        # No private FilePicker: the chat view re-uses the application-
+        # wide one registered on the page overlay by ``gui.main.main``
+        # and exposed via :attr:`AppState.shared_file_picker`. This
+        # also means there is nothing to attach to ``page.overlay``
+        # inside :meth:`build`.
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -222,13 +225,10 @@ class ChatView:
 
     def build(self) -> ft.Control:
         """Compose and return the root :class:`flet.Control` of the view."""
-        # Re-attach the FilePicker to the page overlay; identity-based
-        # comparison avoids the value-equality false positives of
-        # ``__eq__`` overrides in Flet 0.84.
-        existing_overlay_ids = {id(c) for c in self._app_state.page.overlay}
-        if id(self._attach_file_picker) not in existing_overlay_ids:
-            self._app_state.page.overlay.append(self._attach_file_picker)
-
+        # The shared :class:`ft.FilePicker` is already attached to the
+        # page overlay by :func:`gui.main.main`; the chat view simply
+        # re-uses it via :attr:`AppState.shared_file_picker`. No
+        # ``page.overlay`` mutation needed here.
         self._render_initial_system_log_entries()
         self._render_chat_listview_from_cache()
         self._render_logs_listview_from_cache()
@@ -695,7 +695,14 @@ class ChatView:
         )
 
     async def _handle_attach_button_click(self, event: ft.ControlEvent) -> None:
-        picked_files = await self._attach_file_picker.pick_files(
+        shared_file_picker = self._app_state.shared_file_picker
+        if shared_file_picker is None:
+            self._append_system_log_entry(
+                "error",
+                "Shared FilePicker missing from AppState; cannot attach a file.",
+            )
+            return
+        picked_files = await shared_file_picker.pick_files(
             allow_multiple=False,
             dialog_title="Attach a file",
         )

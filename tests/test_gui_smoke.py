@@ -129,19 +129,30 @@ def test_render_view_calls_page_update_exactly_once() -> None:
     assert len(fake_page.controls) == 1
 
 
-def test_connection_view_attaches_file_pickers_to_overlay() -> None:
+def test_connection_view_does_not_mutate_page_overlay() -> None:
+    """The shared FilePicker is registered by gui.main.main, not by the views."""
     fake_page = _build_mock_page()
     state = AppState(page=fake_page)
 
     build_connection_view(state)
-    # Two FilePicker controls land on the page overlay (one per slot).
-    assert len(fake_page.overlay) == 2
+    # The connection view must not append its own FilePicker -- mobile
+    # platforms reject pickers added to the overlay after the first
+    # ``page.update()``. The single shared instance lives on
+    # ``AppState.shared_file_picker``, registered by ``gui.main.main``.
+    assert fake_page.overlay == []
 
 
-def test_chat_view_attaches_attach_file_picker_to_overlay() -> None:
+def test_chat_view_does_not_mutate_page_overlay() -> None:
     fake_page = _build_mock_page()
     state = AppState(page=fake_page)
     state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
 
     build_chat_view(state)
-    assert len(fake_page.overlay) == 1
+    assert fake_page.overlay == []
+
+
+def test_app_state_carries_shared_file_picker_when_provided() -> None:
+    fake_page = _build_mock_page()
+    shared_file_picker = flet.FilePicker()
+    state = AppState(page=fake_page, shared_file_picker=shared_file_picker)
+    assert state.shared_file_picker is shared_file_picker

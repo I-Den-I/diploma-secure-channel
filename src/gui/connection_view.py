@@ -61,8 +61,6 @@ class ConnectionView:
         "_status_text",
         "_progress_indicator",
         "_primary_action_button",
-        "_own_file_picker",
-        "_peer_file_picker",
         "_in_progress",
     )
 
@@ -70,12 +68,12 @@ class ConnectionView:
         self._app_state: Final[AppState] = app_state
         self._in_progress: bool = False
 
-        # Flet 0.84 exposes ``FilePicker.pick_files`` as an async method
-        # that returns the selected files directly (the older
-        # ``on_result`` callback shape was removed). One picker per slot
-        # is still convenient because it isolates state.
-        self._own_file_picker = ft.FilePicker()
-        self._peer_file_picker = ft.FilePicker()
+        # The connection view does **not** create its own
+        # ``ft.FilePicker``: a single shared instance is registered on
+        # ``page.overlay`` upfront by :func:`gui.main.main`, and reused
+        # for every ``pick_files`` call. Pre-registration is mandatory
+        # on Android / iOS, where late overlay attachment surfaces as
+        # "unknown control: File Picker" at runtime.
 
         initial_own_path: Optional[Path] = app_state.own_private_key_path
         initial_peer_path: Optional[Path] = app_state.peer_public_key_path
@@ -147,16 +145,10 @@ class ConnectionView:
 
     def build(self) -> ft.Control:
         """Compose and return the root :class:`flet.Control` of the view."""
-        # File pickers must be attached to the page overlay rather than
-        # to the main control tree so that they can pop up a native
-        # dialog regardless of the surrounding layout. ``ft.FilePicker``
-        # overrides ``__eq__``, so identity-based membership checks are
-        # required to avoid false positives.
-        existing_overlay_ids = {id(control) for control in self._app_state.page.overlay}
-        if id(self._own_file_picker) not in existing_overlay_ids:
-            self._app_state.page.overlay.append(self._own_file_picker)
-        if id(self._peer_file_picker) not in existing_overlay_ids:
-            self._app_state.page.overlay.append(self._peer_file_picker)
+        # No need to touch ``page.overlay`` here: a single shared
+        # ``ft.FilePicker`` is registered upfront by ``gui.main.main``
+        # and lives on :attr:`AppState.shared_file_picker`. Both the
+        # local-private-key and peer-public-key dialogs reuse it.
 
         identity_section: ft.Control = self._build_identity_section()
         role_section: ft.Control = self._build_role_section()
@@ -298,13 +290,9 @@ class ConnectionView:
 
     async def _open_own_file_picker(self, event: ft.ControlEvent) -> None:
         """Open the native file dialog for the local user's private key."""
-        picked_files = await self._own_file_picker.pick_files(
-            allow_multiple=False,
-            dialog_title=_OWN_FILE_PICKER_DIALOG_TITLE,
-            allowed_extensions=["json"],
-            file_type=ft.FilePickerFileType.CUSTOM,
+        chosen_path: Optional[Path] = await self._invoke_shared_file_picker(
+            dialog_title=_OWN_FILE_PICKER_DIALOG_TITLE
         )
-        chosen_path: Optional[Path] = self._extract_picked_path(picked_files)
         if chosen_path is None:
             return
         self._app_state.own_private_key_path = chosen_path
@@ -315,13 +303,9 @@ class ConnectionView:
 
     async def _open_peer_file_picker(self, event: ft.ControlEvent) -> None:
         """Open the native file dialog for the peer's public key."""
-        picked_files = await self._peer_file_picker.pick_files(
-            allow_multiple=False,
-            dialog_title=_PEER_FILE_PICKER_DIALOG_TITLE,
-            allowed_extensions=["json"],
-            file_type=ft.FilePickerFileType.CUSTOM,
+        chosen_path: Optional[Path] = await self._invoke_shared_file_picker(
+            dialog_title=_PEER_FILE_PICKER_DIALOG_TITLE
         )
-        chosen_path: Optional[Path] = self._extract_picked_path(picked_files)
         if chosen_path is None:
             return
         self._app_state.peer_public_key_path = chosen_path
@@ -329,6 +313,30 @@ class ConnectionView:
             chosen_path
         )
         self._app_state.page.update()
+
+    async def _invoke_shared_file_picker(
+        self, *, dialog_title: str
+    ) -> Optional[Path]:
+        """Drive the shared :class:`ft.FilePicker` for one identity slot.
+
+        The view never owns its own picker; instead it asks the
+        application-wide instance attached to :attr:`AppState.shared_file_picker`
+        (registered in :func:`gui.main.main`) to open a native dialog
+        with the supplied title.
+        """
+        shared_file_picker = self._app_state.shared_file_picker
+        if shared_file_picker is None:
+            raise RuntimeError(
+                "Shared FilePicker missing from AppState; "
+                "gui.main.main must register it on the page overlay."
+            )
+        picked_files = await shared_file_picker.pick_files(
+            allow_multiple=False,
+            dialog_title=dialog_title,
+            allowed_extensions=["json"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+        )
+        return self._extract_picked_path(picked_files)
 
     @staticmethod
     def _extract_picked_path(picked_files: object) -> Optional[Path]:

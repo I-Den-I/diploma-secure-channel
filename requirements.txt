@@ -1,3 +1,9 @@
 pytest>=8.0
 pytest-asyncio>=0.23
-flet>=0.21,<1.0
+# Flet 0.84 is the stable line we target: it provides ``flet.run`` (used
+# by gui/main.py since Phase 6), the modern async ``FilePicker.pick_files``
+# API consumed by the connection and chat views, and the cross-platform
+# ``flet build {windows,macos,linux,apk}`` workflow used by the CI/CD
+# pipeline. Older releases (<0.80) lack ``flet.run`` and would crash at
+# entry-point import time; later Flet 1.0+ may introduce breaking changes.
+flet>=0.84,<1.0

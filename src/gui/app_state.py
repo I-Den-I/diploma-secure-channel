@@ -68,6 +68,13 @@ class AppState:
     secure_server: Optional[SecureChannelServer] = None
     server_shutdown_event: Optional[asyncio.Event] = None
     download_directory: Path = field(default_factory=_default_download_directory)
+    # A single FilePicker instance, registered once on the page overlay
+    # by :func:`gui.main.main`, and reused by every view that needs to
+    # open a native file dialog. Pre-registration is mandatory on
+    # mobile platforms (Android / iOS), where Flet otherwise throws an
+    # "unknown control: File Picker" error if the picker is appended
+    # to the overlay lazily after the page has been rendered.
+    shared_file_picker: Optional[ft.FilePicker] = None
     _current_view_builder: Optional[ViewBuilder] = field(default=None, repr=False)
 
     PAGE_TITLE: Final[str] = "DSTU Secure Channel"

@@ -1,14 +1,20 @@
 # Copyright (c) 2026 Denys Nazarenko, Lviv Polytechnic National University.
 """Entry point for the Flet-based secure-channel GUI.
 
-The :func:`main` coroutine is registered with :func:`flet.app` and is
-called by Flet once the page has been instantiated. Its only
+The :func:`main` coroutine is registered with :func:`flet.run` and is
+called by Flet once the page has been instantiated. Its
 responsibilities are:
 
 * configure global page-level properties (title, theme, default size);
-* construct the shared :class:`AppState`;
-* render the initial view (the connection screen) via the small router
-  on :meth:`AppState.render_view`.
+* register a *shared* :class:`flet.FilePicker` on the page overlay
+  *before* any view is rendered, so that every subsequent
+  ``pick_files`` call (identity loaders in the connection view,
+  attachment picker in the chat view) targets a control already known
+  to the Flet runtime --- this is mandatory on Android / iOS, where a
+  late ``page.overlay.append(picker)`` triggers
+  ``unknown control: File Picker`` at runtime;
+* construct the shared :class:`AppState`, attach the file picker to it,
+  and dispatch to the small router on :meth:`AppState.render_view`.
 """
 
 from __future__ import annotations
@@ -31,6 +37,9 @@ async def main(page: ft.Page) -> None:
     :param page: The root page instance supplied by the Flet runtime.
     """
     page.title = _APP_WINDOW_TITLE
+    # Default to dark mode for the messenger aesthetic. The chat view
+    # exposes a runtime theme toggle, so the user can flip to light at
+    # any time.
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 0
     page.window.width = _APP_WINDOW_DEFAULT_WIDTH
@@ -38,14 +47,21 @@ async def main(page: ft.Page) -> None:
     page.window.min_width = 480
     page.window.min_height = 600
 
-    own_key_picker = ft.FilePicker()
-    peer_key_picker = ft.FilePicker()
-    
+    # ------------------------------------------------------------------
+    # Mandatory: pre-register a single shared FilePicker on the page
+    # overlay BEFORE any view is built. Mobile platforms refuse to open
+    # ``pick_files`` dialogs on a control that was attached to the
+    # overlay only after the first ``page.update()``; eager
+    # registration here side-steps that limitation entirely.
+    # ------------------------------------------------------------------
+    shared_file_picker: ft.FilePicker = ft.FilePicker()
+    page.overlay.append(shared_file_picker)
+    page.update()
 
-    page.overlay.extend([own_key_picker, peer_key_picker])
-
-
-    application_state: AppState = AppState(page=page)
+    application_state: AppState = AppState(
+        page=page,
+        shared_file_picker=shared_file_picker,
+    )
 
     async def shutdown_on_window_close(event: ft.WindowEvent) -> None:
         if event.type != ft.WindowEventType.CLOSE:
@@ -55,15 +71,19 @@ async def main(page: ft.Page) -> None:
     page.window.on_event = shutdown_on_window_close
 
     application_state.render_view(build_connection_view)
-    
-    await page.update_async()
 
 
 def run() -> None:
-    """Launch the Flet desktop app."""
+    """Launch the Flet desktop / mobile app.
+
+    Wired up to the ``secure-channel-gui`` console-script entry point in
+    ``pyproject.toml``. Uses :func:`flet.run` (the modern Flet 0.80+
+    entry point); falls back to the deprecated :func:`flet.app` only on
+    legacy builds.
+    """
     if hasattr(ft, "run"):
         ft.run(main)
-    else:
+    else:  # pragma: no cover -- legacy Flet (<0.80)
         ft.app(target=main)
 
 
