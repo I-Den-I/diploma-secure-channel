@@ -41,7 +41,10 @@ jobs:
 
       - name: Build Windows app
         shell: bash
-        run: yes | flet build windows
+        # Вимикаємо pipefail, щоб SIGPIPE від команди 'yes' не вважався помилкою
+        run: |
+          set +o pipefail
+          yes | flet build windows
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -68,7 +71,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build macOS app
-        run: yes | flet build macos
+        run: |
+          set +o pipefail
+          yes | flet build macos
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -106,7 +111,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Linux app
-        run: yes | flet build linux
+        run: |
+          set +o pipefail
+          yes | flet build linux
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -142,7 +149,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Android APK
-        run: yes | flet build apk
+        run: |
+          set +o pipefail
+          yes | flet build apk
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
