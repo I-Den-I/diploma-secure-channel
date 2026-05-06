@@ -39,16 +39,6 @@ def _default_download_directory() -> Path:
     return Path.home() / "DSTU-SecureChannel" / "received"
 
 
-def _default_identities_directory() -> Path:
-    """Return a writable per-user directory for generated identity key pairs.
-
-    Generated private/public key files land under
-    ``~/DSTU-SecureChannel/identities/`` so that all demo artefacts share
-    the same parent directory and can be located without hunting through
-    ``~/Downloads`` or a temp folder.
-    """
-    return Path.home() / "DSTU-SecureChannel" / "identities"
-
 
 @dataclass
 class AppState:
@@ -71,8 +61,10 @@ class AppState:
         through the chat view are written. Created lazily on first
         write.
     :param identities_directory: Directory under which newly generated
-        identity key pairs are saved by the connection view. Created
-        lazily on first key generation.
+        identity key pairs are saved. ``None`` until the connection view
+        resolves the platform-specific path on first use (desktop falls
+        back to ``~/DSTU-SecureChannel/identities/``; mobile uses the
+        app documents directory from :attr:`flet.StoragePaths`).
     """
 
     page: ft.Page
@@ -82,7 +74,7 @@ class AppState:
     secure_server: Optional[SecureChannelServer] = None
     server_shutdown_event: Optional[asyncio.Event] = None
     download_directory: Path = field(default_factory=_default_download_directory)
-    identities_directory: Path = field(default_factory=_default_identities_directory)
+    identities_directory: Optional[Path] = None
     # A single FilePicker instance, registered once on the page overlay
     # by :func:`gui.main.main`, and reused by every view that needs to
     # open a native file dialog. Pre-registration is mandatory on
