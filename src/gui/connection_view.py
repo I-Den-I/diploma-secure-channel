@@ -48,6 +48,7 @@ _DEFAULT_HOST_VALUE: Final[str] = "127.0.0.1"
 _DEFAULT_PORT_VALUE: Final[str] = "9000"
 _OWN_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select your private.json"
 _PEER_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select the peer's public.json"
+_MOBILE_PLATFORMS: Final[frozenset[str]] = frozenset({"android", "android_tv", "ios"})
 
 
 class ConnectionView:
@@ -63,6 +64,7 @@ class ConnectionView:
         "_port_text_field",
         "_own_private_key_path_text",
         "_peer_public_key_path_text",
+        "_saved_keys_dropdown",
         "_status_text",
         "_progress_indicator",
         "_primary_action_button",
@@ -97,6 +99,14 @@ class ConnectionView:
             color=ft.Colors.ON_SURFACE_VARIANT,
             selectable=True,
             no_wrap=False,
+        )
+
+        self._saved_keys_dropdown = ft.Dropdown(
+            label="Saved identities",
+            hint_text="No saved identities",
+            dense=True,
+            options=[],
+            on_select=self._handle_key_selected,
         )
 
         self._role_segmented_button = ft.SegmentedButton(
@@ -165,7 +175,7 @@ class ConnectionView:
         role_section: ft.Control = self._build_role_section()
         action_section: ft.Control = self._build_action_section()
 
-        return ft.Container(
+        root = ft.Container(
             expand=True,
             alignment=ft.Alignment.CENTER,
             padding=ft.Padding.all(48),
@@ -181,6 +191,10 @@ class ConnectionView:
                 ],
             ),
         )
+        # Load saved key history asynchronously so the dropdown is
+        # populated once the page's storage-paths service is ready.
+        self._app_state.page.run_task(self._populate_key_history)
+        return root
 
     # ------------------------------------------------------------------
     # Section builders
@@ -242,6 +256,7 @@ class ConnectionView:
                         spacing=12,
                         wrap=True,
                     ),
+                    self._saved_keys_dropdown,
                     ft.Row(
                         controls=[
                             ft.OutlinedButton(
@@ -377,8 +392,78 @@ class ConnectionView:
         return Path(candidate_path)
 
     # ------------------------------------------------------------------
-    # Identity generation handler
+    # Identity generation and key-history handlers
     # ------------------------------------------------------------------
+
+    async def _resolve_identities_directory(self) -> Path:
+        """Return a platform-appropriate writable directory for key pairs.
+
+        On Android and iOS ``Path.home()`` is either non-existent or
+        permission-denied. :meth:`flet.StoragePaths.get_application_documents_directory`
+        is the correct writable location on those platforms. Desktop
+        platforms keep the original ``~/DSTU-SecureChannel/identities/``
+        path so any keys already on disk are found without migration.
+
+        The resolved path is cached in :attr:`AppState.identities_directory`
+        so that both the generator and the history scanner use the same root.
+        """
+        if self._app_state.identities_directory is not None:
+            return self._app_state.identities_directory
+
+        platform_value: str = str(getattr(self._app_state.page, "platform", "")).lower()
+        if platform_value in _MOBILE_PLATFORMS:
+            base_str: str = (
+                await self._app_state.page.storage_paths.get_application_documents_directory()
+            )
+            resolved = Path(base_str) / "DSTU-SecureChannel" / "identities"
+        else:
+            resolved = Path.home() / "DSTU-SecureChannel" / "identities"
+
+        self._app_state.identities_directory = resolved
+        return resolved
+
+    async def _populate_key_history(self) -> None:
+        """Scan the identities directory and refresh the saved-keys dropdown.
+
+        Called once from :meth:`build` (via ``page.run_task``) and again
+        after every successful key generation. Silently no-ops if the
+        directory does not yet exist.
+        """
+        try:
+            identities_dir = await self._resolve_identities_directory()
+        except Exception:  # noqa: BLE001 — storage_paths not ready yet
+            return
+
+        if not identities_dir.exists():
+            return
+
+        private_files: list[Path] = sorted(
+            identities_dir.glob("private_*.json"), reverse=True
+        )
+        if not private_files:
+            return
+
+        current_path = self._app_state.own_private_key_path
+        self._saved_keys_dropdown.options = [
+            ft.dropdown.Option(key=str(p), text=p.name) for p in private_files
+        ]
+        if current_path is not None and str(current_path) in {
+            str(p) for p in private_files
+        }:
+            self._saved_keys_dropdown.value = str(current_path)
+        self._app_state.page.update()
+
+    def _handle_key_selected(self, event: ft.ControlEvent) -> None:
+        """Load the key chosen from the saved-identities dropdown."""
+        selected_value: Optional[str] = getattr(event, "data", None)
+        if not selected_value:
+            return
+        chosen_path = Path(selected_value)
+        self._app_state.own_private_key_path = chosen_path
+        self._own_private_key_path_text.value = self._format_path_for_display(
+            chosen_path
+        )
+        self._app_state.page.update()
 
     async def _handle_generate_identity_click(self, event: ft.ControlEvent) -> None:
         """Generate a fresh DSTU 4145 key pair and save it to disk.
@@ -386,17 +471,18 @@ class ConnectionView:
         Key generation is offloaded to a worker thread so the Flet event
         loop stays responsive during the CPU-bound scalar multiplication.
         On success the new private-key path is loaded into :attr:`AppState`
-        so the user can immediately proceed to connect.
+        and the saved-identities dropdown is refreshed and auto-selected.
         """
         if self._in_progress:
             return
         self._set_in_progress(True)
         try:
+            identities_dir = await self._resolve_identities_directory()
             private_key_path, public_key_path = await asyncio.to_thread(
                 self._generate_and_save_identity,
-                self._app_state.identities_directory,
+                identities_dir,
             )
-        except OSError as exc:
+        except (OSError, Exception) as exc:  # noqa: BLE001
             self._show_status(f"Could not generate identity: {exc}", error=True)
             return
         finally:
@@ -406,13 +492,15 @@ class ConnectionView:
         self._own_private_key_path_text.value = self._format_path_for_display(
             private_key_path
         )
+        await self._populate_key_history()
+        self._saved_keys_dropdown.value = str(private_key_path)
         self._app_state.page.update()
         self._app_state.page.show_dialog(
             ft.SnackBar(
                 content=ft.Text(
                     f"Identity generated!\n"
-                    f"Private key: {private_key_path}\n"
-                    f"Public key:  {public_key_path}"
+                    f"Private: {private_key_path}\n"
+                    f"Public:  {public_key_path}"
                 ),
                 duration=6000,
             )
@@ -420,7 +508,7 @@ class ConnectionView:
 
     @staticmethod
     def _generate_and_save_identity(identities_dir: Path) -> tuple[Path, Path]:
-        """Create a timestamped key-pair directory and write both JSON files.
+        """Create a timestamped key-pair and write both JSON files.
 
         Runs in a thread pool executor (see caller). Returns the two paths
         so the event-loop thread can update the UI without touching the

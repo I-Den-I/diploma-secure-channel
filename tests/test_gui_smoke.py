@@ -174,13 +174,9 @@ def test_app_state_carries_shared_file_picker_when_provided() -> None:
     assert state.shared_file_picker is shared_file_picker
 
 
-def test_app_state_provides_a_default_identities_directory() -> None:
+def test_app_state_identities_directory_is_none_by_default() -> None:
     state = AppState(page=_build_mock_page())
-    assert isinstance(state.identities_directory, Path)
-    assert state.identities_directory.parts[-2:] == (
-        "DSTU-SecureChannel",
-        "identities",
-    )
+    assert state.identities_directory is None
 
 
 async def test_generate_identity_creates_key_files_and_updates_state(
@@ -219,6 +215,68 @@ async def test_generate_identity_called_twice_produces_distinct_files(
 
     assert len(list(tmp_path.glob("private_*.json"))) == 2
     assert len(list(tmp_path.glob("public_*.json"))) == 2
+
+
+async def test_generate_identity_auto_selects_in_dropdown(
+    tmp_path: Path,
+) -> None:
+    """After generation the saved-keys dropdown value matches the new key path."""
+    from gui.connection_view import ConnectionView
+
+    fake_page = _build_mock_page()
+    state = AppState(page=fake_page, identities_directory=tmp_path)
+    view = ConnectionView(state)
+    view.build()
+
+    await view._handle_generate_identity_click(MagicMock())  # type: ignore[attr-defined]
+
+    private_files = sorted(tmp_path.glob("private_*.json"))
+    assert view._saved_keys_dropdown.value == str(private_files[0])  # type: ignore[attr-defined]
+
+
+async def test_key_history_populated_for_existing_files(
+    tmp_path: Path,
+) -> None:
+    """_populate_key_history fills the dropdown from an existing identities dir."""
+    from gui.connection_view import ConnectionView
+
+    fake_page = _build_mock_page()
+    state = AppState(page=fake_page, identities_directory=tmp_path)
+    view = ConnectionView(state)
+    view.build()
+
+    # Pre-create two key files directly (simulating a previous session).
+    await view._handle_generate_identity_click(MagicMock())  # type: ignore[attr-defined]
+    await view._handle_generate_identity_click(MagicMock())  # type: ignore[attr-defined]
+
+    assert len(view._saved_keys_dropdown.options) == 2  # type: ignore[attr-defined]
+
+
+def test_handle_key_selected_updates_state_and_path_text(
+    tmp_path: Path,
+) -> None:
+    """Selecting an item from the dropdown updates AppState and the path label."""
+    import asyncio
+
+    from gui.connection_view import ConnectionView
+
+    fake_page = _build_mock_page()
+    state = AppState(page=fake_page, identities_directory=tmp_path)
+    view = ConnectionView(state)
+    view.build()
+
+    # Generate one key so the file exists.
+    asyncio.run(view._handle_generate_identity_click(MagicMock()))  # type: ignore[attr-defined]
+    private_files = sorted(tmp_path.glob("private_*.json"))
+    assert private_files
+
+    # Simulate a dropdown change event.
+    state.own_private_key_path = None  # reset
+    fake_event = MagicMock()
+    fake_event.data = str(private_files[0])
+    view._handle_key_selected(fake_event)  # type: ignore[attr-defined]
+
+    assert state.own_private_key_path == private_files[0]
 
 
 def test_register_shared_file_picker_uses_page_services_not_overlay() -> None:
