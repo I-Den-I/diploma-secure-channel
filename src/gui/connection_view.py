@@ -48,7 +48,11 @@ _DEFAULT_HOST_VALUE: Final[str] = "127.0.0.1"
 _DEFAULT_PORT_VALUE: Final[str] = "9000"
 _OWN_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select your private.json"
 _PEER_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select the peer's public.json"
-_MOBILE_PLATFORMS: Final[frozenset[str]] = frozenset({"android", "android_tv", "ios"})
+_MOBILE_PLATFORMS: Final[frozenset[ft.PagePlatform]] = frozenset({
+    ft.PagePlatform.ANDROID,
+    ft.PagePlatform.ANDROID_TV,
+    ft.PagePlatform.IOS,
+})
 
 
 class ConnectionView:
@@ -410,8 +414,7 @@ class ConnectionView:
         if self._app_state.identities_directory is not None:
             return self._app_state.identities_directory
 
-        platform_value: str = str(getattr(self._app_state.page, "platform", "")).lower()
-        if platform_value in _MOBILE_PLATFORMS:
+        if getattr(self._app_state.page, "platform", None) in _MOBILE_PLATFORMS:
             base_str: str = (
                 await self._app_state.page.storage_paths.get_application_documents_directory()
             )
