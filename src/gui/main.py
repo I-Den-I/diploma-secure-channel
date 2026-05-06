@@ -6,15 +6,24 @@ called by Flet once the page has been instantiated. Its
 responsibilities are:
 
 * configure global page-level properties (title, theme, default size);
-* register a *shared* :class:`flet.FilePicker` on the page overlay
-  *before* any view is rendered, so that every subsequent
-  ``pick_files`` call (identity loaders in the connection view,
-  attachment picker in the chat view) targets a control already known
-  to the Flet runtime --- this is mandatory on Android / iOS, where a
-  late ``page.overlay.append(picker)`` triggers
-  ``unknown control: File Picker`` at runtime;
+* register a *shared* :class:`flet.FilePicker` instance on
+  :attr:`flet.Page.services` *before* any view is rendered, so that
+  every subsequent ``pick_files`` call (identity loaders in the
+  connection view, attachment picker in the chat view) targets a
+  service already known to the Flet runtime;
 * construct the shared :class:`AppState`, attach the file picker to it,
   and dispatch to the small router on :meth:`AppState.render_view`.
+
+.. note::
+   In Flet 0.84 ``FilePicker`` lives in
+   :mod:`flet.controls.services.file_picker` and is a *Service*, not a
+   visual ``Control``. Registering a service on ``page.overlay`` (which
+   is what older Flet tutorials show) makes the Flutter front-end try
+   to render it as a widget --- it does not know how, and falls back
+   to the red "Unknown control: FilePicker" banner visible in the top-
+   left corner of the desktop window. The right home for it is
+   :attr:`flet.Page.services`, accessed through the
+   ``register_service`` API of the underlying ``ServiceRegistry``.
 """
 
 from __future__ import annotations
@@ -29,6 +38,26 @@ from gui.connection_view import build_connection_view
 _APP_WINDOW_TITLE: Final[str] = "DSTU Secure Channel"
 _APP_WINDOW_DEFAULT_WIDTH: Final[int] = 720
 _APP_WINDOW_DEFAULT_HEIGHT: Final[int] = 720
+
+
+def _register_shared_file_picker(page: ft.Page) -> ft.FilePicker:
+    """Create and register the application-wide :class:`ft.FilePicker`.
+
+    The function is split out from :func:`main` so the registration
+    contract is testable in isolation (the GUI smoke tests provide a
+    page stub with a mock services registry).
+
+    :param page: The root Flet page.
+    :returns: The freshly registered :class:`ft.FilePicker`.
+    """
+    shared_file_picker: ft.FilePicker = ft.FilePicker()
+    services_registry = page.services
+    if hasattr(services_registry, "register_service"):
+        # Flet 0.84+: services live in a ``ServiceRegistry``.
+        services_registry.register_service(shared_file_picker)
+    else:  # pragma: no cover -- defensive for older Flet builds
+        services_registry.append(shared_file_picker)
+    return shared_file_picker
 
 
 async def main(page: ft.Page) -> None:
@@ -49,14 +78,12 @@ async def main(page: ft.Page) -> None:
 
     # ------------------------------------------------------------------
     # Mandatory: pre-register a single shared FilePicker on the page
-    # overlay BEFORE any view is built. Mobile platforms refuse to open
-    # ``pick_files`` dialogs on a control that was attached to the
-    # overlay only after the first ``page.update()``; eager
-    # registration here side-steps that limitation entirely.
+    # services registry BEFORE any view is built. Putting the picker on
+    # ``page.overlay`` (the Flet-0.27 / pre-services pattern) makes the
+    # Flutter front-end render it as the red "Unknown control" banner
+    # because in 0.84 ``FilePicker`` is a Service, not a Control.
     # ------------------------------------------------------------------
-    shared_file_picker: ft.FilePicker = ft.FilePicker()
-    page.overlay.append(shared_file_picker)
-    page.update()
+    shared_file_picker: ft.FilePicker = _register_shared_file_picker(page)
 
     application_state: AppState = AppState(
         page=page,

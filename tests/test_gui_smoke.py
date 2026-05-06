@@ -35,11 +35,27 @@ from secure_channel.network.connection import (  # noqa: E402
 )
 
 
+class _FakeServiceRegistry:
+    """Tiny stand-in for :class:`flet.controls.page.ServiceRegistry`.
+
+    Only exposes the surface the GUI code touches: a
+    ``register_service`` method and a ``_services`` list inspectable
+    by the smoke tests.
+    """
+
+    def __init__(self) -> None:
+        self._services: list[object] = []
+
+    def register_service(self, service: object) -> None:
+        self._services.append(service)
+
+
 def _build_mock_page() -> object:
     """Create a fake :class:`flet.Page` with the attributes the views use."""
     fake_page = MagicMock(spec=flet.Page)
     fake_page.controls = []
     fake_page.overlay = []
+    fake_page.services = _FakeServiceRegistry()
     fake_page.update = lambda: None
     fake_page.theme_mode = flet.ThemeMode.DARK
     return fake_page
@@ -156,3 +172,27 @@ def test_app_state_carries_shared_file_picker_when_provided() -> None:
     shared_file_picker = flet.FilePicker()
     state = AppState(page=fake_page, shared_file_picker=shared_file_picker)
     assert state.shared_file_picker is shared_file_picker
+
+
+def test_register_shared_file_picker_uses_page_services_not_overlay() -> None:
+    """Regression test for the "Unknown control: FilePicker" red banner.
+
+    In Flet 0.84 ``FilePicker`` is a ``Service``, not a visual
+    ``Control``. Putting one on ``page.overlay`` makes the front-end
+    render it as a fallback red rectangle. The fix is to register the
+    picker on ``page.services`` --- and this test pins that behaviour
+    so an accidental revert to the overlay-based registration is
+    caught locally rather than only at runtime on the macOS / Android
+    bundles.
+    """
+    from gui.main import _register_shared_file_picker
+
+    fake_page = _build_mock_page()
+    picker = _register_shared_file_picker(fake_page)
+
+    assert isinstance(picker, flet.FilePicker)
+    # Picker must NOT have leaked into the overlay --- that is what
+    # produced the "Unknown control" banner in the diploma demo.
+    assert fake_page.overlay == []
+    # Picker MUST have been registered with the services registry.
+    assert picker in fake_page.services._services  # type: ignore[attr-defined]
