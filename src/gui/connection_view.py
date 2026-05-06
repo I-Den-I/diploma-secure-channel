@@ -21,6 +21,7 @@ placeholder chat screen.
 from __future__ import annotations
 
 import asyncio
+import datetime
 from pathlib import Path
 from typing import Final, Optional
 
@@ -28,10 +29,14 @@ import flet as ft
 
 from gui.app_state import AppState
 from gui.chat_view import build_chat_view
+from secure_channel.crypto.dstu4145 import Dstu4145SignatureScheme
+from secure_channel.crypto.dstu4145_curves import DSTU4145_M163_PB
 from secure_channel.identity_io import (
     PRIVATE_KEY_FILE_NAME,
     PUBLIC_KEY_FILE_NAME,
     assemble_handshake_credentials,
+    save_private_key_to_file,
+    save_public_key_to_file,
 )
 from secure_channel.network.client import connect_secure_channel
 from secure_channel.network.connection import SecureChannelConnection
@@ -61,6 +66,7 @@ class ConnectionView:
         "_status_text",
         "_progress_indicator",
         "_primary_action_button",
+        "_generate_identity_button",
         "_in_progress",
     )
 
@@ -137,6 +143,11 @@ class ConnectionView:
             content="Connect",
             icon=ft.Icons.LOCK_OPEN,
             on_click=self._handle_primary_action_click,
+        )
+        self._generate_identity_button = ft.OutlinedButton(
+            content="Generate New Identity",
+            icon=ft.Icons.KEY,
+            on_click=self._handle_generate_identity_click,
         )
 
     # ------------------------------------------------------------------
@@ -241,6 +252,11 @@ class ConnectionView:
                             self._peer_public_key_path_text,
                         ],
                         spacing=12,
+                        wrap=True,
+                    ),
+                    ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
+                    ft.Row(
+                        controls=[self._generate_identity_button],
                         wrap=True,
                     ),
                 ],
@@ -359,6 +375,66 @@ class ConnectionView:
         if not candidate_path:
             return None
         return Path(candidate_path)
+
+    # ------------------------------------------------------------------
+    # Identity generation handler
+    # ------------------------------------------------------------------
+
+    async def _handle_generate_identity_click(self, event: ft.ControlEvent) -> None:
+        """Generate a fresh DSTU 4145 key pair and save it to disk.
+
+        Key generation is offloaded to a worker thread so the Flet event
+        loop stays responsive during the CPU-bound scalar multiplication.
+        On success the new private-key path is loaded into :attr:`AppState`
+        so the user can immediately proceed to connect.
+        """
+        if self._in_progress:
+            return
+        self._set_in_progress(True)
+        try:
+            private_key_path, public_key_path = await asyncio.to_thread(
+                self._generate_and_save_identity,
+                self._app_state.identities_directory,
+            )
+        except OSError as exc:
+            self._show_status(f"Could not generate identity: {exc}", error=True)
+            return
+        finally:
+            self._set_in_progress(False)
+
+        self._app_state.own_private_key_path = private_key_path
+        self._own_private_key_path_text.value = self._format_path_for_display(
+            private_key_path
+        )
+        self._app_state.page.update()
+        self._app_state.page.show_dialog(
+            ft.SnackBar(
+                content=ft.Text(
+                    f"Identity generated!\n"
+                    f"Private key: {private_key_path}\n"
+                    f"Public key:  {public_key_path}"
+                ),
+                duration=6000,
+            )
+        )
+
+    @staticmethod
+    def _generate_and_save_identity(identities_dir: Path) -> tuple[Path, Path]:
+        """Create a timestamped key-pair directory and write both JSON files.
+
+        Runs in a thread pool executor (see caller). Returns the two paths
+        so the event-loop thread can update the UI without touching the
+        filesystem itself.
+        """
+        identities_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        private_key_path = identities_dir / f"private_{timestamp}.json"
+        public_key_path = identities_dir / f"public_{timestamp}.json"
+        scheme = Dstu4145SignatureScheme(DSTU4145_M163_PB)
+        private_key, public_key = scheme.generate_key_pair()
+        save_private_key_to_file(private_key, private_key_path)
+        save_public_key_to_file(public_key, public_key_path)
+        return private_key_path, public_key_path
 
     # ------------------------------------------------------------------
     # Role / button handlers
@@ -518,6 +594,7 @@ class ConnectionView:
     def _set_in_progress(self, in_progress: bool) -> None:
         self._in_progress = in_progress
         self._primary_action_button.disabled = in_progress
+        self._generate_identity_button.disabled = in_progress
         self._progress_indicator.visible = in_progress
         self._app_state.page.update()
 

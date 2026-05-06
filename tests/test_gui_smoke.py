@@ -174,6 +174,53 @@ def test_app_state_carries_shared_file_picker_when_provided() -> None:
     assert state.shared_file_picker is shared_file_picker
 
 
+def test_app_state_provides_a_default_identities_directory() -> None:
+    state = AppState(page=_build_mock_page())
+    assert isinstance(state.identities_directory, Path)
+    assert state.identities_directory.parts[-2:] == (
+        "DSTU-SecureChannel",
+        "identities",
+    )
+
+
+async def test_generate_identity_creates_key_files_and_updates_state(
+    tmp_path: Path,
+) -> None:
+    """Clicking 'Generate New Identity' writes two JSON files and updates AppState."""
+    from gui.connection_view import ConnectionView
+
+    fake_page = _build_mock_page()
+    state = AppState(page=fake_page, identities_directory=tmp_path)
+    view = ConnectionView(state)
+    view.build()
+
+    await view._handle_generate_identity_click(MagicMock())  # type: ignore[attr-defined]
+
+    private_files = sorted(tmp_path.glob("private_*.json"))
+    public_files = sorted(tmp_path.glob("public_*.json"))
+    assert len(private_files) == 1, "Expected exactly one private key file"
+    assert len(public_files) == 1, "Expected exactly one public key file"
+    assert state.own_private_key_path == private_files[0]
+
+
+async def test_generate_identity_called_twice_produces_distinct_files(
+    tmp_path: Path,
+) -> None:
+    """Each invocation creates a uniquely named key pair (microsecond timestamp)."""
+    from gui.connection_view import ConnectionView
+
+    fake_page = _build_mock_page()
+    state = AppState(page=fake_page, identities_directory=tmp_path)
+    view = ConnectionView(state)
+    view.build()
+
+    await view._handle_generate_identity_click(MagicMock())  # type: ignore[attr-defined]
+    await view._handle_generate_identity_click(MagicMock())  # type: ignore[attr-defined]
+
+    assert len(list(tmp_path.glob("private_*.json"))) == 2
+    assert len(list(tmp_path.glob("public_*.json"))) == 2
+
+
 def test_register_shared_file_picker_uses_page_services_not_overlay() -> None:
     """Regression test for the "Unknown control: FilePicker" red banner.
 
