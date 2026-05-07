@@ -60,6 +60,13 @@ ChatSender = Literal["self", "peer", "system"]
 SystemLogLevel = Literal["info", "warn", "error"]
 
 
+_MOBILE_PLATFORMS: Final[frozenset[ft.PagePlatform]] = frozenset({
+    ft.PagePlatform.ANDROID,
+    ft.PagePlatform.ANDROID_TV,
+    ft.PagePlatform.IOS,
+})
+
+
 @dataclass(frozen=True, slots=True)
 class ChatEntry:
     """One row in the scroll-back of the chat pane.
@@ -275,6 +282,14 @@ class ChatView:
     # ------------------------------------------------------------------
 
     def _build_header(self) -> ft.Control:
+        is_mobile: bool = (
+            getattr(self._app_state.page, "platform", None) in _MOBILE_PLATFORMS
+        )
+        return (
+            self._build_mobile_header() if is_mobile else self._build_desktop_header()
+        )
+
+    def _build_desktop_header(self) -> ft.Control:
         peer_address_label: str = self._format_peer_address_for_display()
         role_label: str = self._format_role_for_display()
         return ft.Row(
@@ -321,6 +336,90 @@ class ChatView:
                         self._theme_toggle_button,
                         self._disconnect_button,
                     ],
+                ),
+            ],
+        )
+
+    def _build_mobile_header(self) -> ft.Control:
+        """Compact header tailored for narrow phone screens.
+
+        Inline buttons (theme / log toggle / Disconnect) overflow the
+        viewport on Android and get clipped — half of them disappear
+        completely. Move them into a 3-dot popup menu so the title and
+        secure-session chip always fit, and stack the metadata fields
+        vertically so the long peer-address line wraps cleanly.
+        """
+        peer_address_label: str = self._format_peer_address_for_display()
+        role_label: str = self._format_role_for_display()
+        overflow_menu = ft.PopupMenuButton(
+            icon=ft.Icons.MORE_VERT,
+            tooltip="More",
+            items=[
+                ft.PopupMenuItem(
+                    icon=ft.Icons.TERMINAL,
+                    text="Toggle log panel",
+                    on_click=self._handle_logs_visibility_toggle,
+                ),
+                ft.PopupMenuItem(
+                    icon=self._select_theme_toggle_icon(),
+                    text="Toggle theme",
+                    on_click=self._handle_theme_toggle_click,
+                ),
+                ft.PopupMenuItem(
+                    icon=ft.Icons.LOGOUT,
+                    text="Disconnect",
+                    on_click=self._handle_disconnect_click,
+                ),
+            ],
+        )
+        return ft.Column(
+            tight=True,
+            spacing=4,
+            controls=[
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Row(
+                            spacing=10,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            controls=[
+                                ft.Icon(
+                                    icon=ft.Icons.SHIELD_OUTLINED,
+                                    color=ft.Colors.PRIMARY,
+                                    size=22,
+                                ),
+                                ft.Text(
+                                    value="Secure channel",
+                                    size=16,
+                                    weight=ft.FontWeight.W_600,
+                                ),
+                            ],
+                        ),
+                        ft.Row(
+                            spacing=4,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            controls=[self._status_chip, overflow_menu],
+                        ),
+                    ],
+                ),
+                ft.Text(
+                    value=f"role: {role_label}",
+                    size=11,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                    no_wrap=False,
+                ),
+                ft.Text(
+                    value=f"peer: {peer_address_label}",
+                    size=11,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                    no_wrap=False,
+                ),
+                ft.Text(
+                    value=f"protocol: {self._SUPPORTED_PROTOCOL_LABEL}",
+                    size=11,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                    no_wrap=False,
                 ),
             ],
         )
@@ -628,10 +727,11 @@ class ChatView:
             f"Receiving file: {file_transfer_begin.filename}…",
         )
         try:
-            self._app_state.download_directory.mkdir(parents=True, exist_ok=True)
+            destination_directory = await self._resolve_download_directory()
+            destination_directory.mkdir(parents=True, exist_ok=True)
             destination_file_path = await receive_file_over_secure_channel(
                 connection=self._connection,
-                destination_directory=self._app_state.download_directory,
+                destination_directory=destination_directory,
                 file_transfer_begin=file_transfer_begin,
                 overwrite_existing_file=True,
             )
@@ -645,13 +745,73 @@ class ChatView:
                 "error", f"File transfer aborted: {transport_error}"
             )
             return
+        size_label: str = self._format_byte_count(
+            file_transfer_begin.total_byte_length
+        )
         self._append_chat_entry(
-            "peer", f"📎 {destination_file_path.name}"
+            "peer",
+            f"📎 {destination_file_path.name} ({size_label})",
         )
         self._append_system_log_entry(
             "info",
             f"File written to {destination_file_path} (SHA-256 verified)",
         )
+
+    async def _resolve_download_directory(self) -> Path:
+        """Pick a writable destination for received files.
+
+        On Android ``Path.home()`` resolves to ``/data`` (or worse,
+        depending on the device), which the app cannot write to —
+        attempting to ``mkdir`` raises ``PermissionError`` (errno 13)
+        and aborts the file transfer. This resolver consults
+        ``page.storage_paths`` for a platform-appropriate location:
+
+        1. Public Downloads (visible to file managers); cached in
+           ``app_state.download_directory`` on first success.
+        2. App documents directory ``DSTU_SecureChannel/received/`` —
+           always writable, used as the safe fallback.
+        3. Desktop: keeps the existing ``~/DSTU_SecureChannel/received/``.
+
+        The resolved path is cached on :attr:`AppState.download_directory`
+        so subsequent transfers reuse it without another roundtrip.
+        """
+        page = self._app_state.page
+        is_mobile: bool = (
+            getattr(page, "platform", None) in _MOBILE_PLATFORMS
+        )
+
+        # Desktop default already pointed at home — keep it (test pins this
+        # behaviour and Path.home() is writable on every desktop OS).
+        if not is_mobile:
+            current = self._app_state.download_directory
+            current.mkdir(parents=True, exist_ok=True)
+            return current
+
+        # Mobile: ignore the home-based default and resolve via Flet.
+        try:
+            dl_str: Optional[str] = await page.storage_paths.get_downloads_directory()
+            if dl_str:
+                resolved = Path(dl_str) / "DSTU_SecureChannel"
+                resolved.mkdir(parents=True, exist_ok=True)
+                self._app_state.download_directory = resolved
+                return resolved
+        except Exception:  # noqa: BLE001 — API may be missing on this build
+            pass
+
+        try:
+            target = Path("/storage/emulated/0/Download/DSTU_SecureChannel")
+            target.mkdir(parents=True, exist_ok=True)
+            self._app_state.download_directory = target
+            return target
+        except OSError:
+            pass
+
+        # Last resort: app-private documents directory.
+        docs_str = await page.storage_paths.get_application_documents_directory()
+        resolved = Path(docs_str) / "DSTU_SecureChannel" / "received"
+        resolved.mkdir(parents=True, exist_ok=True)
+        self._app_state.download_directory = resolved
+        return resolved
 
     async def _cancel_background_receive_loop(self) -> None:
         """Cancel the background listener and wait for it to exit cleanly."""
@@ -743,7 +903,10 @@ class ChatView:
                 "error", f"File send failed (I/O): {os_error}"
             )
             return
-        self._append_chat_entry("self", f"📎 {file_path.name}")
+        size_label: str = self._format_byte_count(file_byte_length)
+        self._append_chat_entry(
+            "self", f"📎 {file_path.name} ({size_label})"
+        )
         self._append_system_log_entry(
             "info",
             f"File '{file_path.name}' transmitted; SHA-256 = "
@@ -792,6 +955,17 @@ class ChatView:
         if peer_address is None:
             return "(unknown)"
         return str(peer_address)
+
+    @staticmethod
+    def _format_byte_count(byte_count: int) -> str:
+        """Render an integer byte count in a human-friendly unit."""
+        for unit in ("B", "KB", "MB", "GB"):
+            if byte_count < 1024 or unit == "GB":
+                if unit == "B":
+                    return f"{byte_count} {unit}"
+                return f"{byte_count:.1f} {unit}"
+            byte_count = byte_count / 1024  # type: ignore[assignment]
+        return f"{byte_count:.1f} GB"
 
     @staticmethod
     def _extract_picked_path(picked_files: object) -> Optional[Path]:

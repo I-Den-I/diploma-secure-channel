@@ -65,6 +65,9 @@ class AppState:
         resolves the platform-specific path on first use (desktop falls
         back to ``~/DSTU_SecureChannel/identities/``; mobile uses the
         app documents directory from :attr:`flet.StoragePaths`).
+    :param peers_directory: Directory under which copies of peers'
+        ``public.json`` files are kept so the user does not have to
+        re-pick them every session. Resolved alongside ``identities_directory``.
     """
 
     page: ft.Page
@@ -75,6 +78,7 @@ class AppState:
     server_shutdown_event: Optional[asyncio.Event] = None
     download_directory: Path = field(default_factory=_default_download_directory)
     identities_directory: Optional[Path] = None
+    peers_directory: Optional[Path] = None
     # A single FilePicker instance, registered once on the page overlay
     # by :func:`gui.main.main`, and reused by every view that needs to
     # open a native file dialog. Pre-registration is mandatory on
