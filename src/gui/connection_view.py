@@ -479,19 +479,26 @@ class ConnectionView:
         if not is_mobile:
             return await _attempt(Path.home() / "Downloads")
 
-        # Android — try the public Downloads folder via Flet's helper.
+        # Android — write straight to the public Downloads folder. This is
+        # the only location all stock file managers (Files, Mi File Manager,
+        # Total Commander, …) reliably show on every Android version.
+        # MANAGE_EXTERNAL_STORAGE / WRITE_EXTERNAL_STORAGE are declared in
+        # pyproject.toml so the write succeeds on devices that grant either.
+        hit = await _attempt(Path("/storage/emulated/0/Download"))
+        if hit is not None:
+            return hit
+
+        # Last resort: ask Flet for the platform's idea of Downloads.
+        # Useful on iOS / unusual Android forks where the AOSP path is
+        # absent; harmless when it isn't.
         try:
             dl_str = await self._app_state.page.storage_paths.get_downloads_directory()
             if dl_str:
-                hit = await _attempt(Path(dl_str))
-                if hit is not None:
-                    return hit
+                return await _attempt(Path(dl_str))
         except Exception:  # noqa: BLE001 — API may be missing on this build
             pass
 
-        # AOSP fallback — only works if MANAGE_EXTERNAL_STORAGE was granted
-        # by the user in system Settings (not a normal runtime prompt).
-        return await _attempt(Path("/storage/emulated/0/Download"))
+        return None
 
     def _show_export_dialog(
         self,
