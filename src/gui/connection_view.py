@@ -21,6 +21,7 @@ placeholder chat screen.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from typing import Final, Optional
 
@@ -73,6 +74,7 @@ class ConnectionView:
         "_primary_action_button",
         "_generate_identity_button",
         "_identity_name_text_field",
+        "_export_public_key_button",
         "_in_progress",
     )
 
@@ -168,6 +170,11 @@ class ConnectionView:
         self._identity_name_text_field = ft.TextField(
             label="Identity Name",
             hint_text="Leave empty to use 'default'",
+        )
+        self._export_public_key_button = ft.OutlinedButton(
+            content="Export Public Key",
+            icon=ft.Icons.UPLOAD_FILE,
+            on_click=self._handle_export_public_key_click,
         )
 
     # ------------------------------------------------------------------
@@ -267,7 +274,14 @@ class ConnectionView:
                         spacing=12,
                         wrap=True,
                     ),
-                    self._saved_keys_dropdown,
+                    ft.Row(
+                        controls=[
+                            self._saved_keys_dropdown,
+                            self._export_public_key_button,
+                        ],
+                        spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                     ft.Row(
                         controls=[
                             ft.OutlinedButton(
@@ -441,6 +455,74 @@ class ConnectionView:
         self._app_state.identities_directory = resolved
         return resolved
 
+    async def _resolve_downloads_directory(self) -> Path:
+        """Return a user-visible Downloads directory, platform-appropriate.
+
+        On Android, tries ``StoragePaths.get_downloads_directory()`` first,
+        then falls back to ``/storage/emulated/0/Download`` (works on all
+        standard AOSP devices). On desktop, returns ``~/Downloads``.
+        The directory is created lazily on first use.
+        """
+        if getattr(self._app_state.page, "platform", None) in _MOBILE_PLATFORMS:
+            try:
+                dl_str: Optional[str] = (
+                    await self._app_state.page.storage_paths.get_downloads_directory()
+                )
+                if dl_str:
+                    p = Path(dl_str)
+                    p.mkdir(parents=True, exist_ok=True)
+                    return p
+            except Exception:  # noqa: BLE001 — API not available on this build
+                pass
+            # Standard AOSP fallback — readable by Files / file-manager apps.
+            fallback = Path("/storage/emulated/0/Download")
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        else:
+            p = Path.home() / "Downloads"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+
+    async def _handle_export_public_key_click(self, event: ft.ControlEvent) -> None:
+        """Copy the current identity's public key to the Downloads folder.
+
+        Derives the public-key filename from the selected private key by
+        replacing the ``private`` prefix with ``public``. Runs the file
+        copy in a thread pool so the UI stays responsive.
+        """
+        own_path = self._app_state.own_private_key_path
+        if own_path is None:
+            self._show_status("Select an identity first.", error=True)
+            return
+
+        public_key_name = own_path.name.replace("private", "public", 1)
+        public_key_path = own_path.parent / public_key_name
+
+        if not public_key_path.exists():
+            self._show_status(
+                f"Public key not found: {public_key_name}", error=True
+            )
+            return
+
+        try:
+            downloads_dir = await self._resolve_downloads_directory()
+            dest = downloads_dir / public_key_name
+            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(dest))
+        except OSError as exc:
+            self._show_status(f"Export failed: {exc}", error=True)
+            return
+
+        self._show_status(f"Exported → Downloads/{public_key_name}")
+        self._app_state.page.show_dialog(
+            ft.SnackBar(
+                content=ft.Text(
+                    f"Public key copied to Downloads:\n{public_key_name}\n"
+                    f"Share this file with your peer."
+                ),
+                duration=6000,
+            )
+        )
+
     async def _populate_key_history(self) -> None:
         """Scan the identities directory and refresh the saved-keys dropdown.
 
@@ -516,14 +598,26 @@ class ConnectionView:
         await self._populate_key_history()
         self._saved_keys_dropdown.value = str(private_key_path)
         self._app_state.page.update()
+
+        # Auto-copy the public key to Downloads so the user can share it.
+        downloads_note = ""
+        try:
+            downloads_dir = await self._resolve_downloads_directory()
+            dest = downloads_dir / public_key_path.name
+            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(dest))
+            downloads_note = f"\nAlso copied to Downloads/{public_key_path.name}"
+        except OSError:
+            downloads_note = "\n(Could not auto-copy to Downloads)"
+
         self._app_state.page.show_dialog(
             ft.SnackBar(
                 content=ft.Text(
                     f"Identity generated!\n"
                     f"Private: {private_key_path.name}\n"
                     f"Public:  {public_key_path.name}"
+                    f"{downloads_note}"
                 ),
-                duration=6000,
+                duration=7000,
             )
         )
 
@@ -739,6 +833,7 @@ class ConnectionView:
         self._in_progress = in_progress
         self._primary_action_button.disabled = in_progress
         self._generate_identity_button.disabled = in_progress
+        self._export_public_key_button.disabled = in_progress
         self._progress_indicator.visible = in_progress
         self._app_state.page.update()
 
