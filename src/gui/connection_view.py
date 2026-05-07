@@ -69,6 +69,7 @@ class ConnectionView:
         "_own_private_key_path_text",
         "_peer_public_key_path_text",
         "_saved_keys_dropdown",
+        "_saved_peer_keys_dropdown",
         "_status_text",
         "_progress_indicator",
         "_primary_action_button",
@@ -113,6 +114,13 @@ class ConnectionView:
             dense=True,
             options=[],
             on_select=self._handle_key_selected,
+        )
+        self._saved_peer_keys_dropdown = ft.Dropdown(
+            label="Saved peer keys",
+            hint_text="No saved peer keys",
+            dense=True,
+            options=[],
+            on_select=self._handle_peer_key_selected,
         )
 
         self._role_segmented_button = ft.SegmentedButton(
@@ -209,9 +217,10 @@ class ConnectionView:
                 ],
             ),
         )
-        # Load saved key history asynchronously so the dropdown is
+        # Load saved key history asynchronously so the dropdowns are
         # populated once the page's storage-paths service is ready.
         self._app_state.page.run_task(self._populate_key_history)
+        self._app_state.page.run_task(self._populate_peer_key_history)
         return root
 
     # ------------------------------------------------------------------
@@ -291,6 +300,7 @@ class ConnectionView:
                         spacing=12,
                         wrap=True,
                     ),
+                    self._saved_peer_keys_dropdown,
                     ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
                     ft.Row(
                         controls=[
@@ -364,15 +374,40 @@ class ConnectionView:
         self._app_state.page.update()
 
     async def _open_peer_file_picker(self, event: ft.ControlEvent) -> None:
-        """Open the native file dialog for the peer's public key."""
+        """Open the native file dialog for the peer's public key.
+
+        After the user picks a file we *copy* its contents into our
+        managed ``peers`` directory and keep the persistent copy as the
+        active path. On Android the picker often returns a transient
+        content:// URI that becomes invalid after the session ends —
+        the local copy survives that and powers the saved-peer-keys
+        dropdown across launches.
+        """
         chosen_path: Optional[Path] = await self._invoke_shared_file_picker(
             dialog_title=_PEER_FILE_PICKER_DIALOG_TITLE
         )
         if chosen_path is None:
             return
-        self._app_state.peer_public_key_path = chosen_path
+
+        active_path: Path = chosen_path
+        try:
+            peers_dir = await self._resolve_peers_directory()
+            persistent_copy = peers_dir / chosen_path.name
+            if str(chosen_path) != str(persistent_copy):
+                await asyncio.to_thread(
+                    shutil.copy2, str(chosen_path), str(persistent_copy)
+                )
+            active_path = persistent_copy
+            await self._populate_peer_key_history()
+            self._saved_peer_keys_dropdown.value = str(persistent_copy)
+        except OSError:
+            # Best-effort — if we can't copy, fall back to the original
+            # path so the handshake itself still succeeds.
+            pass
+
+        self._app_state.peer_public_key_path = active_path
         self._peer_public_key_path_text.value = self._format_path_for_display(
-            chosen_path
+            active_path
         )
         self._app_state.page.update()
 
@@ -451,6 +486,56 @@ class ConnectionView:
 
         self._app_state.identities_directory = resolved
         return resolved
+
+    async def _resolve_peers_directory(self) -> Path:
+        """Return a writable directory for cached copies of peer public keys.
+
+        Lives alongside the user's identities at ``<identities_dir>/../peers``
+        so the same platform-specific resolution logic applies. Cached on
+        :attr:`AppState.peers_directory` to avoid repeated path probes.
+        """
+        if self._app_state.peers_directory is not None:
+            return self._app_state.peers_directory
+        identities_dir = await self._resolve_identities_directory()
+        resolved = identities_dir.parent / "peers"
+        resolved.mkdir(parents=True, exist_ok=True)
+        self._app_state.peers_directory = resolved
+        return resolved
+
+    async def _populate_peer_key_history(self) -> None:
+        """Refresh the saved-peer-keys dropdown from the peers directory."""
+        try:
+            peers_dir = await self._resolve_peers_directory()
+        except Exception:  # noqa: BLE001 — storage_paths not ready yet
+            return
+        if not peers_dir.exists():
+            return
+        peer_files: list[Path] = sorted(
+            peers_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        if not peer_files:
+            return
+        current_path = self._app_state.peer_public_key_path
+        self._saved_peer_keys_dropdown.options = [
+            ft.dropdown.Option(key=str(p), text=p.name) for p in peer_files
+        ]
+        if current_path is not None and str(current_path) in {
+            str(p) for p in peer_files
+        }:
+            self._saved_peer_keys_dropdown.value = str(current_path)
+        self._app_state.page.update()
+
+    def _handle_peer_key_selected(self, event: ft.ControlEvent) -> None:
+        """Load a peer public key chosen from the saved-peer-keys dropdown."""
+        selected_value: Optional[str] = getattr(event, "data", None)
+        if not selected_value:
+            return
+        chosen_path = Path(selected_value)
+        self._app_state.peer_public_key_path = chosen_path
+        self._peer_public_key_path_text.value = self._format_path_for_display(
+            chosen_path
+        )
+        self._app_state.page.update()
 
     async def _try_save_to_public_downloads(
         self, public_key_path: Path, public_key_name: str
