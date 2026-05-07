@@ -150,7 +150,7 @@ class ConnectionView:
         )
 
         self._status_text = ft.Text(
-            value="", size=13, selectable=True, no_wrap=False, expand=True
+            value="", size=13, selectable=True, no_wrap=False
         )
         self._progress_indicator = ft.ProgressRing(
             visible=False, width=18, height=18, stroke_width=2
@@ -168,7 +168,6 @@ class ConnectionView:
         self._identity_name_text_field = ft.TextField(
             label="Identity Name",
             hint_text="Leave empty to use 'default'",
-            expand=True,
         )
 
     # ------------------------------------------------------------------
@@ -194,6 +193,7 @@ class ConnectionView:
                 width=560,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 spacing=20,
+                scroll=ft.ScrollMode.AUTO,
                 controls=[
                     self._build_header(),
                     identity_section,
