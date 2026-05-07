@@ -21,7 +21,6 @@ placeholder chat screen.
 from __future__ import annotations
 
 import asyncio
-import datetime
 from pathlib import Path
 from typing import Final, Optional
 
@@ -73,6 +72,7 @@ class ConnectionView:
         "_progress_indicator",
         "_primary_action_button",
         "_generate_identity_button",
+        "_identity_name_text_field",
         "_in_progress",
     )
 
@@ -149,7 +149,9 @@ class ConnectionView:
             keyboard_type=ft.KeyboardType.NUMBER,
         )
 
-        self._status_text = ft.Text(value="", size=13, selectable=True)
+        self._status_text = ft.Text(
+            value="", size=13, selectable=True, no_wrap=False, expand=True
+        )
         self._progress_indicator = ft.ProgressRing(
             visible=False, width=18, height=18, stroke_width=2
         )
@@ -162,6 +164,11 @@ class ConnectionView:
             content="Generate New Identity",
             icon=ft.Icons.KEY,
             on_click=self._handle_generate_identity_click,
+        )
+        self._identity_name_text_field = ft.TextField(
+            label="Identity Name",
+            hint_text="Leave empty to use 'default'",
+            expand=True,
         )
 
     # ------------------------------------------------------------------
@@ -275,7 +282,11 @@ class ConnectionView:
                     ),
                     ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
                     ft.Row(
-                        controls=[self._generate_identity_button],
+                        controls=[
+                            self._identity_name_text_field,
+                            self._generate_identity_button,
+                        ],
+                        spacing=12,
                         wrap=True,
                     ),
                 ],
@@ -309,12 +320,17 @@ class ConnectionView:
         )
 
     def _build_action_section(self) -> ft.Control:
-        return ft.Row(
-            spacing=12,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        return ft.Column(
+            spacing=8,
             controls=[
-                self._primary_action_button,
-                self._progress_indicator,
+                ft.Row(
+                    spacing=12,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        self._primary_action_button,
+                        self._progress_indicator,
+                    ],
+                ),
                 self._status_text,
             ],
         )
@@ -405,7 +421,7 @@ class ConnectionView:
         On Android and iOS ``Path.home()`` is either non-existent or
         permission-denied. :meth:`flet.StoragePaths.get_application_documents_directory`
         is the correct writable location on those platforms. Desktop
-        platforms keep the original ``~/DSTU-SecureChannel/identities/``
+        platforms keep the original ``~/DSTU_SecureChannel/identities/``
         path so any keys already on disk are found without migration.
 
         The resolved path is cached in :attr:`AppState.identities_directory`
@@ -418,9 +434,9 @@ class ConnectionView:
             base_str: str = (
                 await self._app_state.page.storage_paths.get_application_documents_directory()
             )
-            resolved = Path(base_str) / "DSTU-SecureChannel" / "identities"
+            resolved = Path(base_str) / "DSTU_SecureChannel" / "identities"
         else:
-            resolved = Path.home() / "DSTU-SecureChannel" / "identities"
+            resolved = Path.home() / "DSTU_SecureChannel" / "identities"
 
         self._app_state.identities_directory = resolved
         return resolved
@@ -479,11 +495,13 @@ class ConnectionView:
         if self._in_progress:
             return
         self._set_in_progress(True)
+        name = (self._identity_name_text_field.value or "").strip() or "default"
         try:
             identities_dir = await self._resolve_identities_directory()
             private_key_path, public_key_path = await asyncio.to_thread(
                 self._generate_and_save_identity,
                 identities_dir,
+                name,
             )
         except (OSError, Exception) as exc:  # noqa: BLE001
             self._show_status(f"Could not generate identity: {exc}", error=True)
@@ -502,25 +520,35 @@ class ConnectionView:
             ft.SnackBar(
                 content=ft.Text(
                     f"Identity generated!\n"
-                    f"Private: {private_key_path}\n"
-                    f"Public:  {public_key_path}"
+                    f"Private: {private_key_path.name}\n"
+                    f"Public:  {public_key_path.name}"
                 ),
                 duration=6000,
             )
         )
 
     @staticmethod
-    def _generate_and_save_identity(identities_dir: Path) -> tuple[Path, Path]:
-        """Create a timestamped key-pair and write both JSON files.
+    def _generate_and_save_identity(
+        identities_dir: Path, name: str
+    ) -> tuple[Path, Path]:
+        """Create a named key-pair and write both JSON files.
 
         Runs in a thread pool executor (see caller). Returns the two paths
         so the event-loop thread can update the UI without touching the
-        filesystem itself.
+        filesystem itself. If files with the given name already exist, a
+        numeric suffix (_1, _2, …) is appended until a free slot is found.
         """
         identities_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S_%f")
-        private_key_path = identities_dir / f"private_{timestamp}.json"
-        public_key_path = identities_dir / f"public_{timestamp}.json"
+        private_key_path = identities_dir / f"private_{name}.json"
+        public_key_path = identities_dir / f"public_{name}.json"
+        if private_key_path.exists() or public_key_path.exists():
+            n = 1
+            while True:
+                private_key_path = identities_dir / f"private_{name}_{n}.json"
+                public_key_path = identities_dir / f"public_{name}_{n}.json"
+                if not private_key_path.exists() and not public_key_path.exists():
+                    break
+                n += 1
         scheme = Dstu4145SignatureScheme(DSTU4145_M163_PB)
         private_key, public_key = scheme.generate_key_pair()
         save_private_key_to_file(private_key, private_key_path)
@@ -605,7 +633,32 @@ class ConnectionView:
                 f"Handshake rejected: {handshake_error}", error=True
             )
             return
-        except (OSError, asyncio.TimeoutError) as transport_error:
+        except ConnectionRefusedError:
+            self._set_in_progress(False)
+            self._show_status("Connection refused.", error=True)
+            self._app_state.page.show_dialog(
+                ft.SnackBar(
+                    content=ft.Text(
+                        "Connection refused (Errno 111): Check the target IP"
+                        " and ensure the server is listening."
+                    ),
+                    duration=6000,
+                )
+            )
+            return
+        except (TimeoutError, asyncio.TimeoutError):
+            self._set_in_progress(False)
+            self._show_status("Connection timed out.", error=True)
+            self._app_state.page.show_dialog(
+                ft.SnackBar(
+                    content=ft.Text(
+                        "Connection timed out. Check the target IP and port."
+                    ),
+                    duration=6000,
+                )
+            )
+            return
+        except OSError as transport_error:
             self._set_in_progress(False)
             self._show_status(
                 f"Transport error: {transport_error}", error=True
@@ -700,10 +753,7 @@ class ConnectionView:
     def _format_path_for_display(file_path: Optional[Path]) -> str:
         if file_path is None:
             return "(no file selected)"
-        try:
-            return str(file_path.resolve())
-        except OSError:
-            return str(file_path)
+        return file_path.name
 
 
 def build_connection_view(app_state: AppState) -> ft.Control:

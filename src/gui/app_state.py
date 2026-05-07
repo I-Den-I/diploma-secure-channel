@@ -32,11 +32,11 @@ ViewBuilder = Callable[["AppState"], ft.Control]
 def _default_download_directory() -> Path:
     """Return a writable per-user directory for files received over the channel.
 
-    The convention --- ``~/DSTU-SecureChannel/received/`` --- avoids
+    The convention --- ``~/DSTU_SecureChannel/received/`` --- avoids
     clobbering ``~/Downloads`` and keeps every file produced by the
     diploma demo under a single, easily inspectable folder.
     """
-    return Path.home() / "DSTU-SecureChannel" / "received"
+    return Path.home() / "DSTU_SecureChannel" / "received"
 
 
 
@@ -63,7 +63,7 @@ class AppState:
     :param identities_directory: Directory under which newly generated
         identity key pairs are saved. ``None`` until the connection view
         resolves the platform-specific path on first use (desktop falls
-        back to ``~/DSTU-SecureChannel/identities/``; mobile uses the
+        back to ``~/DSTU_SecureChannel/identities/``; mobile uses the
         app documents directory from :attr:`flet.StoragePaths`).
     """
 

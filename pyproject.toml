@@ -65,6 +65,8 @@ description = "Secure messenger built on DSTU 7624 (Kalyna) and DSTU 4145."
 # to open with "unknown control: File Picker" / "permission denied"
 # errors at runtime.
 [tool.flet.android.permission]
+"android.permission.INTERNET" = true
+"android.permission.ACCESS_NETWORK_STATE" = true
 "android.permission.READ_EXTERNAL_STORAGE" = true
 "android.permission.WRITE_EXTERNAL_STORAGE" = true
 "android.permission.MANAGE_EXTERNAL_STORAGE" = true

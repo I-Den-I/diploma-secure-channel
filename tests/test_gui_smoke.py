@@ -84,7 +84,7 @@ def test_app_state_holds_the_page() -> None:
 def test_app_state_provides_a_default_download_directory() -> None:
     state = AppState(page=_build_mock_page())
     assert isinstance(state.download_directory, Path)
-    assert state.download_directory.parts[-2:] == ("DSTU-SecureChannel", "received")
+    assert state.download_directory.parts[-2:] == ("DSTU_SecureChannel", "received")
 
 
 def test_connection_view_root_is_a_flet_control() -> None:
@@ -202,7 +202,7 @@ async def test_generate_identity_creates_key_files_and_updates_state(
 async def test_generate_identity_called_twice_produces_distinct_files(
     tmp_path: Path,
 ) -> None:
-    """Each invocation creates a uniquely named key pair (microsecond timestamp)."""
+    """Each invocation creates a uniquely named key pair (numeric suffix on collision)."""
     from gui.connection_view import ConnectionView
 
     fake_page = _build_mock_page()
