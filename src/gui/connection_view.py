@@ -452,14 +452,119 @@ class ConnectionView:
         self._app_state.identities_directory = resolved
         return resolved
 
-    async def _handle_export_public_key_click(self, event: ft.ControlEvent) -> None:
-        """Open a native Save-As dialog for the current identity's public key.
+    async def _resolve_export_directory(self) -> tuple[Path, str]:
+        """Find the most user-visible writable directory for an exported key.
 
-        On Android this surfaces the system Storage Access Framework
-        chooser so the user picks any visible location (Downloads,
-        Documents, Drive, SD card, …). On desktop it shows the standard
-        save dialog. The public-key filename is derived from the selected
-        private key by replacing the ``private`` prefix with ``public``.
+        Tries, in order:
+
+        1. ``StoragePaths.get_downloads_directory()`` — the public Downloads
+           folder, visible to every file manager (when permissions allow).
+        2. ``StoragePaths.get_external_storage_directory()/Download`` — the
+           app-external-files area; always writable on Android without
+           runtime permissions, visible at *Internal Storage / Android /
+           data / <package> / files / Download / ...*.
+        3. ``StoragePaths.get_application_documents_directory()/Exports``
+           — app-private storage; visible only via ADB but guaranteed
+           writable as a last-resort fallback.
+        4. Desktop: ``~/Downloads``.
+
+        Each candidate is probed with a short write test before returning,
+        so we never report success on a path that will then 500 on copy.
+        Returns ``(path, label)`` where *label* is a short human description
+        for the success dialog.
+        """
+        is_mobile: bool = (
+            getattr(self._app_state.page, "platform", None) in _MOBILE_PLATFORMS
+        )
+
+        async def _try(candidate: Path) -> bool:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                probe = candidate / ".dstu_write_probe"
+                await asyncio.to_thread(probe.touch)
+                await asyncio.to_thread(probe.unlink)
+                return True
+            except OSError:
+                return False
+
+        if not is_mobile:
+            target = Path.home() / "Downloads"
+            if await _try(target):
+                return target, "Downloads"
+            return Path.home(), "Home"
+
+        storage_paths = self._app_state.page.storage_paths
+
+        # 1) Public Downloads
+        try:
+            dl_str = await storage_paths.get_downloads_directory()
+            if dl_str:
+                target = Path(dl_str)
+                if await _try(target):
+                    return target, "Downloads (public)"
+        except Exception:  # noqa: BLE001 — API may be missing on this build
+            pass
+
+        # 2) App-external-files / Download — always works on Android
+        try:
+            ext_str = await storage_paths.get_external_storage_directory()
+            if ext_str:
+                target = Path(ext_str) / "Download"
+                if await _try(target):
+                    return target, "App external storage / Download"
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 3) Documents directory (app-private) — last resort
+        docs_str = await storage_paths.get_application_documents_directory()
+        target = Path(docs_str) / "Exports"
+        await _try(target)
+        return target, "App documents / Exports (private to the app)"
+
+    def _show_export_success_dialog(self, file_path: Path, location_label: str) -> None:
+        """Show a modal dialog with the full saved path so the user can locate it."""
+        page = self._app_state.page
+
+        def _close(event: ft.ControlEvent) -> None:
+            dialog.open = False
+            page.update()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Public key exported"),
+            content=ft.Column(
+                tight=True,
+                spacing=10,
+                controls=[
+                    ft.Text(f"Location: {location_label}"),
+                    ft.Text(
+                        str(file_path),
+                        size=12,
+                        selectable=True,
+                        color=ft.Colors.PRIMARY,
+                        no_wrap=False,
+                    ),
+                    ft.Text(
+                        "Open this file with a file manager and share it"
+                        " with your peer (Telegram, email, AirDrop, …).",
+                        size=12,
+                        color=ft.Colors.ON_SURFACE_VARIANT,
+                        no_wrap=False,
+                    ),
+                ],
+            ),
+            actions=[ft.TextButton("OK", on_click=_close)],
+        )
+        page.show_dialog(dialog)
+
+    async def _handle_export_public_key_click(self, event: ft.ControlEvent) -> None:
+        """Copy the current identity's public key to a user-visible location.
+
+        Selects the best writable directory via :meth:`_resolve_export_directory`
+        and shows a modal dialog with the absolute path so the user can find
+        the file from any file manager. The public-key filename is derived
+        from the selected private key by replacing the ``private`` prefix
+        with ``public``.
         """
         own_path = self._app_state.own_private_key_path
         if own_path is None:
@@ -475,42 +580,19 @@ class ConnectionView:
             )
             return
 
-        shared_picker = self._app_state.shared_file_picker
-        if shared_picker is None:
-            self._show_status("File picker unavailable.", error=True)
-            return
-
-        chosen_path_str: Optional[str] = await shared_picker.save_file(
-            dialog_title="Save public key as",
-            file_name=public_key_name,
-            allowed_extensions=["json"],
-            file_type=ft.FilePickerFileType.CUSTOM,
-        )
-        if not chosen_path_str:
-            return  # User cancelled
-
-        chosen_path = Path(chosen_path_str)
-        # Some Flet builds return a path without a suffix on Android — make
-        # sure the saved file ends with .json so peers can pick it back up.
-        if chosen_path.suffix.lower() != ".json":
-            chosen_path = chosen_path.with_suffix(".json")
-
         try:
-            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(chosen_path))
+            export_dir, location_label = await self._resolve_export_directory()
+            dest = export_dir / public_key_name
+            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(dest))
         except OSError as exc:
             self._show_status(f"Export failed: {exc}", error=True)
             return
+        except Exception as exc:  # noqa: BLE001 — surface anything else to UI
+            self._show_status(f"Export failed: {exc}", error=True)
+            return
 
-        self._show_status(f"Exported → {chosen_path.name}")
-        self._app_state.page.show_dialog(
-            ft.SnackBar(
-                content=ft.Text(
-                    f"Public key saved to:\n{chosen_path}\n"
-                    f"Share this file with your peer."
-                ),
-                duration=6000,
-            )
-        )
+        self._show_status(f"Exported → {dest}")
+        self._show_export_success_dialog(dest, location_label)
 
     async def _populate_key_history(self) -> None:
         """Scan the identities directory and refresh the saved-keys dropdown.
