@@ -274,13 +274,10 @@ class ConnectionView:
                         spacing=12,
                         wrap=True,
                     ),
+                    self._saved_keys_dropdown,
                     ft.Row(
-                        controls=[
-                            self._saved_keys_dropdown,
-                            self._export_public_key_button,
-                        ],
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[self._export_public_key_button],
+                        wrap=True,
                     ),
                     ft.Row(
                         controls=[
@@ -455,40 +452,14 @@ class ConnectionView:
         self._app_state.identities_directory = resolved
         return resolved
 
-    async def _resolve_downloads_directory(self) -> Path:
-        """Return a user-visible Downloads directory, platform-appropriate.
-
-        On Android, tries ``StoragePaths.get_downloads_directory()`` first,
-        then falls back to ``/storage/emulated/0/Download`` (works on all
-        standard AOSP devices). On desktop, returns ``~/Downloads``.
-        The directory is created lazily on first use.
-        """
-        if getattr(self._app_state.page, "platform", None) in _MOBILE_PLATFORMS:
-            try:
-                dl_str: Optional[str] = (
-                    await self._app_state.page.storage_paths.get_downloads_directory()
-                )
-                if dl_str:
-                    p = Path(dl_str)
-                    p.mkdir(parents=True, exist_ok=True)
-                    return p
-            except Exception:  # noqa: BLE001 — API not available on this build
-                pass
-            # Standard AOSP fallback — readable by Files / file-manager apps.
-            fallback = Path("/storage/emulated/0/Download")
-            fallback.mkdir(parents=True, exist_ok=True)
-            return fallback
-        else:
-            p = Path.home() / "Downloads"
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-
     async def _handle_export_public_key_click(self, event: ft.ControlEvent) -> None:
-        """Copy the current identity's public key to the Downloads folder.
+        """Open a native Save-As dialog for the current identity's public key.
 
-        Derives the public-key filename from the selected private key by
-        replacing the ``private`` prefix with ``public``. Runs the file
-        copy in a thread pool so the UI stays responsive.
+        On Android this surfaces the system Storage Access Framework
+        chooser so the user picks any visible location (Downloads,
+        Documents, Drive, SD card, …). On desktop it shows the standard
+        save dialog. The public-key filename is derived from the selected
+        private key by replacing the ``private`` prefix with ``public``.
         """
         own_path = self._app_state.own_private_key_path
         if own_path is None:
@@ -504,19 +475,37 @@ class ConnectionView:
             )
             return
 
+        shared_picker = self._app_state.shared_file_picker
+        if shared_picker is None:
+            self._show_status("File picker unavailable.", error=True)
+            return
+
+        chosen_path_str: Optional[str] = await shared_picker.save_file(
+            dialog_title="Save public key as",
+            file_name=public_key_name,
+            allowed_extensions=["json"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+        )
+        if not chosen_path_str:
+            return  # User cancelled
+
+        chosen_path = Path(chosen_path_str)
+        # Some Flet builds return a path without a suffix on Android — make
+        # sure the saved file ends with .json so peers can pick it back up.
+        if chosen_path.suffix.lower() != ".json":
+            chosen_path = chosen_path.with_suffix(".json")
+
         try:
-            downloads_dir = await self._resolve_downloads_directory()
-            dest = downloads_dir / public_key_name
-            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(dest))
+            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(chosen_path))
         except OSError as exc:
             self._show_status(f"Export failed: {exc}", error=True)
             return
 
-        self._show_status(f"Exported → Downloads/{public_key_name}")
+        self._show_status(f"Exported → {chosen_path.name}")
         self._app_state.page.show_dialog(
             ft.SnackBar(
                 content=ft.Text(
-                    f"Public key copied to Downloads:\n{public_key_name}\n"
+                    f"Public key saved to:\n{chosen_path}\n"
                     f"Share this file with your peer."
                 ),
                 duration=6000,
@@ -599,23 +588,13 @@ class ConnectionView:
         self._saved_keys_dropdown.value = str(private_key_path)
         self._app_state.page.update()
 
-        # Auto-copy the public key to Downloads so the user can share it.
-        downloads_note = ""
-        try:
-            downloads_dir = await self._resolve_downloads_directory()
-            dest = downloads_dir / public_key_path.name
-            await asyncio.to_thread(shutil.copy2, str(public_key_path), str(dest))
-            downloads_note = f"\nAlso copied to Downloads/{public_key_path.name}"
-        except OSError:
-            downloads_note = "\n(Could not auto-copy to Downloads)"
-
         self._app_state.page.show_dialog(
             ft.SnackBar(
                 content=ft.Text(
                     f"Identity generated!\n"
                     f"Private: {private_key_path.name}\n"
-                    f"Public:  {public_key_path.name}"
-                    f"{downloads_note}"
+                    f"Public:  {public_key_path.name}\n"
+                    f"Tap 'Export Public Key' to save it where you can find it."
                 ),
                 duration=7000,
             )
