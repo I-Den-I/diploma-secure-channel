@@ -38,6 +38,7 @@ import flet as ft
 from gui.app_state import AppState
 from secure_channel.crypto.kalyna_aead import AuthenticationFailed
 from secure_channel.network.connection import (
+    MessageMetrics,
     SecureChannelConnection,
     SecureChannelConnectionClosed,
 )
@@ -76,11 +77,20 @@ class ChatEntry:
         ``"peer"`` for messages from the remote side, ``"system"`` for
         chat-level notices (e.g. "Peer disconnected").
     :param text: The displayed text of the entry.
+    :param verified: ``True`` if the message passed Kalyna AEAD MAC
+        verification (or, for outgoing self-messages, was successfully
+        sealed without error). ``False`` for tampered records — those
+        get a red ✗ icon and the literal text "Tampered!".
+    :param metrics: Per-message crypto stats (encryption time, sealed
+        size). ``None`` for non-payload entries (system notices,
+        tamper records that never decrypted successfully).
     """
 
     timestamp: _datetime.datetime
     sender: ChatSender
     text: str
+    verified: bool = True
+    metrics: Optional[MessageMetrics] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +141,8 @@ class ChatView:
         "_status_chip",
         "_logs_panel_visible",
         "_logs_visibility_button",
+        "_tamper_button",
+        "_export_logs_button",
         "_chat_entries",
         "_system_log_entries",
     )
@@ -219,6 +231,16 @@ class ChatView:
             icon=ft.Icons.TERMINAL,
             tooltip="Toggle system / crypto log panel",
             on_click=self._handle_logs_visibility_toggle,
+        )
+        self._tamper_button = ft.IconButton(
+            icon=ft.Icons.BUG_REPORT,
+            tooltip="Simulate tamper: corrupt the next incoming record",
+            on_click=self._handle_tamper_click,
+        )
+        self._export_logs_button = ft.IconButton(
+            icon=ft.Icons.DOWNLOAD,
+            tooltip="Export chat & system log as JSON",
+            on_click=self._handle_export_logs_click,
         )
         # No private FilePicker: the chat view re-uses the application-
         # wide one registered on the page overlay by ``gui.main.main``
@@ -332,6 +354,8 @@ class ChatView:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
                         self._status_chip,
+                        self._tamper_button,
+                        self._export_logs_button,
                         self._logs_visibility_button,
                         self._theme_toggle_button,
                         self._disconnect_button,
@@ -355,6 +379,16 @@ class ChatView:
             icon=ft.Icons.MORE_VERT,
             tooltip="More",
             items=[
+                ft.PopupMenuItem(
+                    icon=ft.Icons.BUG_REPORT,
+                    text="Simulate tamper (next message)",
+                    on_click=self._handle_tamper_click,
+                ),
+                ft.PopupMenuItem(
+                    icon=ft.Icons.DOWNLOAD,
+                    text="Export logs (JSON)",
+                    on_click=self._handle_export_logs_click,
+                ),
                 ft.PopupMenuItem(
                     icon=ft.Icons.TERMINAL,
                     text="Toggle log panel",
@@ -538,13 +572,71 @@ class ChatView:
                 ),
             )
         is_self: bool = entry.sender == "self"
-        bubble_bgcolor = (
-            ft.Colors.PRIMARY_CONTAINER if is_self else ft.Colors.SURFACE_CONTAINER_HIGH
-        )
-        bubble_textcolor = (
-            ft.Colors.ON_PRIMARY_CONTAINER if is_self else ft.Colors.ON_SURFACE
-        )
+        is_tampered: bool = not entry.verified
+        if is_tampered:
+            bubble_bgcolor = ft.Colors.ERROR_CONTAINER
+            bubble_textcolor = ft.Colors.ON_ERROR_CONTAINER
+        else:
+            bubble_bgcolor = (
+                ft.Colors.PRIMARY_CONTAINER
+                if is_self
+                else ft.Colors.SURFACE_CONTAINER_HIGH
+            )
+            bubble_textcolor = (
+                ft.Colors.ON_PRIMARY_CONTAINER if is_self else ft.Colors.ON_SURFACE
+            )
         sender_label: str = "you" if is_self else "peer"
+
+        # Integrity indicator: green ✓ on success, red ✗ when MAC failed.
+        integrity_icon = ft.Icon(
+            icon=ft.Icons.CANCEL if is_tampered else ft.Icons.VERIFIED,
+            color=ft.Colors.RED_400 if is_tampered else ft.Colors.GREEN_400,
+            size=14,
+            tooltip=(
+                "Tampered! MAC verification failed."
+                if is_tampered
+                else "Integrity verified (Kalyna AEAD)"
+            ),
+        )
+
+        # Footer row: sender · timestamp · integrity icon (+ optional metrics).
+        footer_controls: list[ft.Control] = [
+            ft.Text(
+                value=f"{sender_label} · {timestamp_label}",
+                size=10,
+                color=ft.Colors.ON_SURFACE_VARIANT,
+            ),
+            integrity_icon,
+        ]
+        bubble_children: list[ft.Control] = [
+            ft.Text(
+                value=entry.text,
+                color=bubble_textcolor,
+                selectable=True,
+                size=14,
+            ),
+            ft.Row(
+                spacing=4,
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=footer_controls,
+            ),
+        ]
+        if entry.metrics is not None:
+            crypto_action = "Encrypted" if is_self else "Decrypted+verified"
+            bubble_children.append(
+                ft.Text(
+                    value=(
+                        f"{crypto_action} with Kalyna in "
+                        f"{entry.metrics.crypto_duration_milliseconds:.2f} ms · "
+                        f"{entry.metrics.sealed_byte_length} B on the wire"
+                    ),
+                    size=9,
+                    italic=True,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                )
+            )
+
         return ft.Row(
             alignment=ft.MainAxisAlignment.END if is_self else ft.MainAxisAlignment.START,
             controls=[
@@ -563,19 +655,7 @@ class ChatView:
                             if is_self
                             else ft.CrossAxisAlignment.START
                         ),
-                        controls=[
-                            ft.Text(
-                                value=entry.text,
-                                color=bubble_textcolor,
-                                selectable=True,
-                                size=14,
-                            ),
-                            ft.Text(
-                                value=f"{sender_label} · {timestamp_label}",
-                                size=10,
-                                color=ft.Colors.ON_SURFACE_VARIANT,
-                            ),
-                        ],
+                        controls=bubble_children,
                     ),
                 ),
             ],
@@ -620,11 +700,20 @@ class ChatView:
     # State-mutating helpers (call ``page.update()`` at the end!)
     # ------------------------------------------------------------------
 
-    def _append_chat_entry(self, sender: ChatSender, text: str) -> None:
+    def _append_chat_entry(
+        self,
+        sender: ChatSender,
+        text: str,
+        *,
+        verified: bool = True,
+        metrics: Optional[MessageMetrics] = None,
+    ) -> None:
         entry = ChatEntry(
             timestamp=_datetime.datetime.now(),
             sender=sender,
             text=text,
+            verified=verified,
+            metrics=metrics,
         )
         self._chat_entries.append(entry)
         self._chat_listview.controls.append(self._render_chat_entry(entry))
@@ -677,7 +766,9 @@ class ChatView:
         try:
             while True:
                 try:
-                    message = await self._connection.receive_message()
+                    message, metrics = (
+                        await self._connection.receive_message_with_metrics()
+                    )
                 except SecureChannelConnectionClosed:
                     self._append_system_log_entry(
                         "warn", "Peer closed the connection"
@@ -685,16 +776,32 @@ class ChatView:
                     self._append_chat_entry("system", "Peer disconnected.")
                     return
                 except AuthenticationFailed as authentication_error:
+                    # Surface the bad record both in the log AND as a
+                    # red-bubble chat entry so the user sees clearly
+                    # that the integrity check rejected the message.
+                    # This is the visible payoff of the Simulate-tamper
+                    # debug button.
                     self._append_system_log_entry(
-                        "error", f"Record rejected: {authentication_error}"
+                        "error",
+                        f"Tampered record rejected: {authentication_error}",
+                    )
+                    self._append_chat_entry(
+                        "peer",
+                        "Tampered! (MAC verification failed)",
+                        verified=False,
                     )
                     continue
 
                 if isinstance(message, TextMessage):
-                    self._append_chat_entry("peer", message.text)
+                    self._append_chat_entry(
+                        "peer", message.text, verified=True, metrics=metrics
+                    )
                     self._append_system_log_entry(
                         "info",
-                        f"Received {len(message.text)} chars (Kalyna AEAD verified)",
+                        f"Received {len(message.text)} chars "
+                        f"(Kalyna AEAD verified in "
+                        f"{metrics.crypto_duration_milliseconds:.2f} ms; "
+                        f"{metrics.sealed_byte_length} B sealed)",
                     )
                 elif isinstance(message, FileTransferBegin):
                     await self._receive_file_continuation(message)
@@ -842,16 +949,23 @@ class ChatView:
         self._composer_textfield.value = ""
         self._safely_update_page()
         try:
-            await self._connection.send_message(TextMessage(text=text_to_send))
+            metrics = await self._connection.send_message_with_metrics(
+                TextMessage(text=text_to_send)
+            )
         except SecureChannelConnectionClosed:
             self._append_system_log_entry(
                 "error", "Cannot send message: peer disconnected"
             )
             return
-        self._append_chat_entry("self", text_to_send)
+        self._append_chat_entry(
+            "self", text_to_send, verified=True, metrics=metrics
+        )
         self._append_system_log_entry(
             "info",
-            f"Sent {len(text_to_send)} chars (Kalyna AEAD encrypt-then-MAC)",
+            f"Sent {len(text_to_send)} chars "
+            f"(Kalyna AEAD encrypt-then-MAC in "
+            f"{metrics.crypto_duration_milliseconds:.2f} ms; "
+            f"{metrics.sealed_byte_length} B sealed)",
         )
 
     async def _handle_attach_button_click(self, event: ft.ControlEvent) -> None:
@@ -942,6 +1056,214 @@ class ChatView:
         await self._cancel_background_receive_loop()
         await self._app_state.shutdown_active_session()
         self._app_state.render_view(lambda state: ConnectionView(state).build())
+
+    def _handle_tamper_click(self, event: ft.ControlEvent) -> None:
+        """Arm the connection so the next incoming record fails MAC.
+
+        Sets :attr:`SecureChannelConnection.tamper_next_incoming_record`,
+        which causes one byte of the next sealed record to be flipped
+        before AEAD verification — guaranteed to raise
+        :class:`AuthenticationFailed` and trigger the red-bubble
+        "Tampered!" path in the listener loop. The flag auto-resets
+        after one use.
+        """
+        self._connection.tamper_next_incoming_record = True
+        self._append_system_log_entry(
+            "warn",
+            "Tamper armed: the next incoming record will be corrupted "
+            "before MAC verification (debug demo)",
+        )
+
+    async def _handle_export_logs_click(self, event: ft.ControlEvent) -> None:
+        """Export chat entries + system log as a JSON document.
+
+        On every platform we surface the JSON in a copyable-content
+        dialog (works regardless of storage permissions). On platforms
+        where we can also write a file we append the saved path.
+        """
+        json_payload = self._build_export_payload_json()
+        suggested_filename = (
+            f"secure_channel_log_"
+            f"{_datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}.json"
+        )
+        saved_path = await self._try_save_logs_file(
+            suggested_filename, json_payload
+        )
+        self._show_export_logs_dialog(
+            suggested_filename, json_payload, saved_path
+        )
+
+    def _build_export_payload_json(self) -> str:
+        """Serialise the full session log into a JSON string.
+
+        Includes session metadata (role, peer, protocol), every chat
+        entry with its verification status and crypto metrics, and
+        every system-log line. Designed for offline analysis: load the
+        file in pandas / matplotlib to graph crypto duration vs
+        plaintext size for the diploma write-up.
+        """
+        import json  # noqa: PLC0415 — local import keeps module load lean
+
+        peer_address = self._connection.peer_address
+        peer_address_str = str(peer_address) if peer_address is not None else None
+
+        chat_entries_json = [
+            {
+                "timestamp": entry.timestamp.isoformat(),
+                "sender": entry.sender,
+                "text": entry.text,
+                "verified": entry.verified,
+                "metrics": (
+                    {
+                        "plaintext_byte_length": entry.metrics.plaintext_byte_length,
+                        "sealed_byte_length": entry.metrics.sealed_byte_length,
+                        "crypto_duration_ms": (
+                            entry.metrics.crypto_duration_milliseconds
+                        ),
+                    }
+                    if entry.metrics is not None
+                    else None
+                ),
+            }
+            for entry in self._chat_entries
+        ]
+        system_log_json = [
+            {
+                "timestamp": entry.timestamp.isoformat(),
+                "level": entry.level,
+                "message": entry.message,
+            }
+            for entry in self._system_log_entries
+        ]
+        payload = {
+            "exported_at": _datetime.datetime.now().isoformat(),
+            "session": {
+                "role": self._format_role_for_display(),
+                "peer_address": peer_address_str,
+                "protocol": self._SUPPORTED_PROTOCOL_LABEL,
+            },
+            "chat_entries": chat_entries_json,
+            "system_log": system_log_json,
+        }
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    async def _try_save_logs_file(
+        self, suggested_filename: str, payload: str
+    ) -> Optional[Path]:
+        """Best-effort write of *payload* to a user-visible location.
+
+        Tries the same destinations as the public-key export (public
+        Downloads on Android; ~/Downloads on desktop). Returns the
+        actual path on success, ``None`` on any failure — the caller
+        falls back to the always-available copy-to-clipboard option in
+        the export dialog.
+        """
+        page = self._app_state.page
+        is_mobile: bool = (
+            getattr(page, "platform", None) in _MOBILE_PLATFORMS
+        )
+
+        async def _attempt(target_dir: Path) -> Optional[Path]:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                dest = target_dir / suggested_filename
+                await asyncio.to_thread(dest.write_text, payload)
+                return dest
+            except OSError:
+                return None
+
+        if not is_mobile:
+            return await _attempt(Path.home() / "Downloads")
+
+        hit = await _attempt(Path("/storage/emulated/0/Download"))
+        if hit is not None:
+            return hit
+        try:
+            dl_str = await page.storage_paths.get_downloads_directory()
+            if dl_str:
+                return await _attempt(Path(dl_str))
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _show_export_logs_dialog(
+        self,
+        file_name: str,
+        json_payload: str,
+        saved_path: Optional[Path],
+    ) -> None:
+        """Modal dialog showing the JSON + Copy + optional saved-path info."""
+        page = self._app_state.page
+
+        def _close(event: ft.ControlEvent) -> None:
+            dialog.open = False
+            page.update()
+
+        async def _copy(event: ft.ControlEvent) -> None:
+            try:
+                await page.set_clipboard_async(json_payload)
+            except Exception:  # noqa: BLE001
+                page.set_clipboard(json_payload)
+            copy_button.content = "Copied to clipboard"
+            copy_button.icon = ft.Icons.CHECK
+            page.update()
+
+        content_field = ft.TextField(
+            value=json_payload,
+            read_only=True,
+            multiline=True,
+            min_lines=6,
+            max_lines=14,
+            text_size=10,
+        )
+        copy_button = ft.FilledButton(
+            content="Copy JSON",
+            icon=ft.Icons.CONTENT_COPY,
+            on_click=_copy,
+        )
+        controls: list[ft.Control] = [
+            ft.Text(f"Filename: {file_name}", weight=ft.FontWeight.W_500),
+            ft.Text(
+                "Use this JSON for offline analysis (e.g. graph crypto "
+                "duration vs message size in pandas / matplotlib).",
+                size=12,
+                color=ft.Colors.ON_SURFACE_VARIANT,
+                no_wrap=False,
+            ),
+            content_field,
+            copy_button,
+        ]
+        if saved_path is not None:
+            controls.extend([
+                ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
+                ft.Text(
+                    "Also saved as file:",
+                    size=12,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+                ft.Text(
+                    str(saved_path),
+                    size=11,
+                    selectable=True,
+                    color=ft.Colors.PRIMARY,
+                    no_wrap=False,
+                ),
+            ])
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Export logs"),
+            content=ft.Container(
+                width=560,
+                content=ft.Column(
+                    tight=True,
+                    spacing=10,
+                    scroll=ft.ScrollMode.AUTO,
+                    controls=controls,
+                ),
+            ),
+            actions=[ft.TextButton("Close", on_click=_close)],
+        )
+        page.show_dialog(dialog)
 
     # ------------------------------------------------------------------
     # Small helpers

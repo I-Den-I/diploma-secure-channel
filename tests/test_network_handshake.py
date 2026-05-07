@@ -19,8 +19,10 @@ from secure_channel.crypto.dstu4145 import (
     Dstu4145SignatureScheme,
 )
 from secure_channel.crypto.dstu4145_curves import DSTU4145_M163_PB
+from secure_channel.crypto.kalyna_aead import AuthenticationFailed
 from secure_channel.network.client import connect_secure_channel
 from secure_channel.network.connection import (
+    MessageMetrics,
     SecureChannelConnection,
     SecureChannelConnectionClosed,
 )
@@ -151,3 +153,109 @@ async def test_handshake_fails_when_server_uses_wrong_initiator_key() -> None:
     # The server-side handler is never invoked because the handshake
     # failed before authentication completed.
     assert handler_invocation_count == 0
+
+
+@pytest.mark.asyncio
+async def test_send_and_receive_with_metrics_returns_message_metrics() -> None:
+    """send_message_with_metrics / receive_message_with_metrics report stats."""
+    initiator_private_key, responder_private_key = _generate_long_term_keys()
+    initiator_credentials = _credentials_for(
+        initiator_private_key, responder_private_key
+    )
+    responder_credentials = _credentials_for(
+        responder_private_key, initiator_private_key
+    )
+    server_done = asyncio.Event()
+    server_metrics: list[MessageMetrics] = []
+
+    async def server_side_handler(connection: SecureChannelConnection) -> None:
+        try:
+            message, metrics = await connection.receive_message_with_metrics()
+            assert isinstance(message, TextMessage)
+            server_metrics.append(metrics)
+            send_metrics = await connection.send_message_with_metrics(
+                TextMessage(text=f"echo:{message.text}")
+            )
+            server_metrics.append(send_metrics)
+        except SecureChannelConnectionClosed:
+            pass
+        finally:
+            server_done.set()
+
+    server = SecureChannelServer(
+        credentials=responder_credentials,
+        connection_handler=server_side_handler,
+    )
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        async with await connect_secure_channel(
+            host="127.0.0.1",
+            port=server.bound_port,
+            credentials=initiator_credentials,
+        ) as client_connection:
+            client_send = await client_connection.send_message_with_metrics(
+                TextMessage(text="hello-metrics")
+            )
+            response, client_recv = (
+                await client_connection.receive_message_with_metrics()
+            )
+            assert isinstance(response, TextMessage)
+            assert response.text == "echo:hello-metrics"
+        await asyncio.wait_for(server_done.wait(), timeout=5.0)
+    finally:
+        await server.close()
+
+    # Both endpoints saw two MessageMetrics — one for each direction.
+    assert len(server_metrics) == 2
+    for metrics in (client_send, client_recv, *server_metrics):
+        assert isinstance(metrics, MessageMetrics)
+        # Sealed records carry the AEAD tag, so they're always longer
+        # than the plaintext record they wrap.
+        assert metrics.sealed_byte_length > metrics.plaintext_byte_length
+        # Crypto duration is non-negative; relax to >= 0 since perf_counter
+        # may legitimately measure 0 on very fast systems with low resolution.
+        assert metrics.crypto_duration_seconds >= 0
+        assert metrics.crypto_duration_milliseconds == (
+            metrics.crypto_duration_seconds * 1000.0
+        )
+
+
+@pytest.mark.asyncio
+async def test_tamper_next_incoming_record_triggers_authentication_failed() -> None:
+    """Setting tamper_next_incoming_record corrupts one byte → MAC fails."""
+    initiator_private_key, responder_private_key = _generate_long_term_keys()
+    initiator_credentials = _credentials_for(
+        initiator_private_key, responder_private_key
+    )
+    responder_credentials = _credentials_for(
+        responder_private_key, initiator_private_key
+    )
+    server_done = asyncio.Event()
+
+    async def server_side_handler(connection: SecureChannelConnection) -> None:
+        try:
+            await connection.send_message(TextMessage(text="payload"))
+        finally:
+            server_done.set()
+
+    server = SecureChannelServer(
+        credentials=responder_credentials,
+        connection_handler=server_side_handler,
+    )
+    await server.start(host="127.0.0.1", port=0)
+    try:
+        async with await connect_secure_channel(
+            host="127.0.0.1",
+            port=server.bound_port,
+            credentials=initiator_credentials,
+        ) as client_connection:
+            client_connection.tamper_next_incoming_record = True
+            with pytest.raises(AuthenticationFailed):
+                await asyncio.wait_for(
+                    client_connection.receive_message(), timeout=5.0
+                )
+            # Flag should auto-reset after one use.
+            assert client_connection.tamper_next_incoming_record is False
+        await asyncio.wait_for(server_done.wait(), timeout=5.0)
+    finally:
+        await server.close()
