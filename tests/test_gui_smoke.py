@@ -752,3 +752,103 @@ async def test_persist_endpoint_swallows_storage_failures() -> None:
     view.build()
     # Should not raise even though awaiting a regular MagicMock would.
     await view._persist_endpoint("10.0.0.42", 8443)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Received-file destination on Android (mirrors public-key export path)
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_download_directory_returns_desktop_default() -> None:
+    """On non-mobile platforms the resolver returns AppState's default."""
+    from gui.chat_view import ChatView
+
+    state = AppState(page=_build_mock_page())
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    chat_view = ChatView(state)
+
+    resolved = await chat_view._resolve_download_directory()  # type: ignore[attr-defined]
+    # Desktop default is ~/DSTU_SecureChannel/received — must NOT be
+    # silently rewritten to the Android Downloads path.
+    assert resolved == state.download_directory
+    assert resolved.parts[-2:] == ("DSTU_SecureChannel", "received")
+
+
+async def test_resolve_download_directory_prefers_aosp_downloads_on_android(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Android the resolver should pick /storage/emulated/0/Download
+    (no DSTU_SecureChannel subfolder), matching the public-key export
+    target. We monkey-patch the literal path to a tmp_path so the
+    write-probe succeeds even on a developer's Mac."""
+    from gui.chat_view import ChatView
+    import gui.chat_view as chat_view_module
+
+    fake_aosp_path = tmp_path / "Download"
+    fake_aosp_path.mkdir()
+
+    real_path_cls = chat_view_module.Path
+
+    class _RoutingPath(type(real_path_cls())):
+        def __new__(cls, *args, **kwargs):
+            if args and args[0] == "/storage/emulated/0/Download":
+                return real_path_cls(str(fake_aosp_path))
+            return real_path_cls(*args, **kwargs)
+
+    monkeypatch.setattr(chat_view_module, "Path", _RoutingPath)
+
+    page = _build_mock_page()
+    page.platform = flet.PagePlatform.ANDROID  # type: ignore[attr-defined]
+    state = AppState(page=page)
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    chat_view = ChatView(state)
+
+    resolved = await chat_view._resolve_download_directory()  # type: ignore[attr-defined]
+    assert resolved == fake_aosp_path
+    # The cached AppState path should now point at the same location so
+    # subsequent transfers reuse the resolved Downloads directory.
+    assert state.download_directory == fake_aosp_path
+    # Crucially: no DSTU_SecureChannel subfolder — files land alongside
+    # the public keys exported by ConnectionView.
+    assert "DSTU_SecureChannel" not in resolved.parts
+
+
+async def test_resolve_download_directory_skips_unwritable_aosp_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the AOSP path is unwritable, fall through to Flet's helper
+    instead of silently writing into a path the user can't access."""
+    from gui.chat_view import ChatView
+    import gui.chat_view as chat_view_module
+
+    real_path_cls = chat_view_module.Path
+    flet_helper_path = tmp_path / "downloads_via_helper"
+    flet_helper_path.mkdir()
+
+    class _UnwritableAospPath(type(real_path_cls())):
+        def __new__(cls, *args, **kwargs):
+            if args and args[0] == "/storage/emulated/0/Download":
+                # Point AOSP probe at a path whose mkdir will raise.
+                return real_path_cls("/proc/1/aosp_unwritable_probe")
+            return real_path_cls(*args, **kwargs)
+
+    monkeypatch.setattr(chat_view_module, "Path", _UnwritableAospPath)
+
+    page = _build_mock_page()
+    page.platform = flet.PagePlatform.ANDROID  # type: ignore[attr-defined]
+    page.storage_paths = MagicMock()  # type: ignore[attr-defined]
+    page.storage_paths.get_downloads_directory = AsyncMock(  # type: ignore[attr-defined]
+        return_value=str(flet_helper_path)
+    )
+    page.storage_paths.get_application_documents_directory = AsyncMock(  # type: ignore[attr-defined]
+        return_value=str(tmp_path / "docs")
+    )
+
+    state = AppState(page=page)
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    chat_view = ChatView(state)
+
+    resolved = await chat_view._resolve_download_directory()  # type: ignore[attr-defined]
+    # AOSP write-probe failed → resolver should have moved on to Flet's
+    # get_downloads_directory(), which returned our tmp helper path.
+    assert resolved == flet_helper_path
