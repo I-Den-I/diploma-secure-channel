@@ -98,16 +98,42 @@ class AppState:
         rejects a missing ``secure_connection``), the current view
         stays visible so the user keeps seeing whatever error / state
         led to the failed transition rather than being stranded on a
-        blank / gray page. Fixes a regression where a failed
-        connection-attempt → chat-view transition produced an empty
-        screen on Android.
+        blank / gray page.
+
+        Builder failures are surfaced via a SnackBar — without this,
+        Flet 0.84 silently swallows builder exceptions raised inside
+        an ``on_click`` coroutine and the user is left wondering why
+        a button did nothing. The exception is re-raised so callers
+        can still react if they need to (the current connection-view
+        click-handler catches the re-raise to mark the operation
+        failed). Fixes a regression where a botched chat-view
+        transition produced an empty screen on Android with no
+        feedback.
 
         :param view_builder: Callable returning the root :class:`ft.Control`
             of the new view.
+        :raises Exception: Any exception raised by ``view_builder`` is
+            re-raised after the SnackBar has been queued — the
+            previous view stays mounted in that case.
         """
-        # If view_builder raises, none of the mutations below run and
-        # the existing view stays mounted — no gray-screen window.
-        new_root_control: ft.Control = view_builder(self)
+        try:
+            new_root_control: ft.Control = view_builder(self)
+        except Exception as builder_error:  # noqa: BLE001 — surface to UI
+            # Best-effort SnackBar so the user sees *something* instead
+            # of a button-press that does nothing.
+            try:
+                self.page.show_dialog(
+                    ft.SnackBar(
+                        content=ft.Text(
+                            f"Could not open the next view: {builder_error}",
+                            no_wrap=False,
+                        ),
+                        duration=10000,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — SnackBar is best-effort
+                pass
+            raise
         self._current_view_builder = view_builder
         self.page.controls.clear()
         self.page.controls.append(new_root_control)

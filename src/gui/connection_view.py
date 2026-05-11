@@ -21,6 +21,7 @@ placeholder chat screen.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from pathlib import Path
 from typing import Any, Final, Optional
@@ -77,6 +78,7 @@ class ConnectionView:
         "_generate_identity_button",
         "_identity_name_text_field",
         "_export_public_key_button",
+        "_paste_peer_key_button",
         "_in_progress",
         "_pending_action_task",
     )
@@ -201,6 +203,11 @@ class ConnectionView:
             icon=ft.Icons.UPLOAD_FILE,
             on_click=self._handle_export_public_key_click,
         )
+        self._paste_peer_key_button = ft.OutlinedButton(
+            content="Paste peer's public key",
+            icon=ft.Icons.CONTENT_PASTE,
+            on_click=self._handle_paste_peer_key_click,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -312,6 +319,7 @@ class ConnectionView:
                                 icon=ft.Icons.PERSON_OUTLINE,
                                 on_click=self._open_peer_file_picker,
                             ),
+                            self._paste_peer_key_button,
                             self._peer_public_key_path_text,
                         ],
                         spacing=12,
@@ -554,6 +562,168 @@ class ConnectionView:
             chosen_path
         )
         self._app_state.page.update()
+
+    def _handle_paste_peer_key_click(self, event: ft.ControlEvent) -> None:
+        """Open a modal dialog for pasting the peer's public-key JSON.
+
+        Mirror image of the Export Public Key dialog: the peer copies
+        the JSON out of *their* export modal and sends it via any
+        messenger; the local user pastes it here. The dialog validates
+        the schema (must be a JSON object with ``version``, ``curve``,
+        ``x_coordinate_hex``, ``y_coordinate_hex`` keys), writes it to
+        ``<peers_dir>/public_<name>.json``, then plumbs the new path
+        through the same code paths the file picker uses.
+        """
+        page = self._app_state.page
+
+        name_field = ft.TextField(
+            label="Save as (name)",
+            hint_text="e.g. alice — file will be public_<name>.json",
+            value="peer",
+        )
+        json_field = ft.TextField(
+            label="Paste peer's public-key JSON here",
+            multiline=True,
+            min_lines=5,
+            max_lines=12,
+            text_size=11,
+            hint_text=(
+                '{\n'
+                '  "version": 1,\n'
+                '  "curve": "DSTU4145_M163_PB",\n'
+                '  "x_coordinate_hex": "…",\n'
+                '  "y_coordinate_hex": "…"\n'
+                '}'
+            ),
+        )
+        error_text = ft.Text(value="", color=ft.Colors.ERROR, size=12, no_wrap=False)
+
+        def _close_dialog() -> None:
+            dialog.open = False
+            self._safely_update_page()
+
+        def _on_cancel(_event: ft.ControlEvent) -> None:
+            _close_dialog()
+
+        async def _on_save(_event: ft.ControlEvent) -> None:
+            name_raw: str = (name_field.value or "").strip()
+            json_raw: str = (json_field.value or "").strip()
+            validation_error: Optional[str] = self._validate_pasted_peer_key(
+                name_raw, json_raw
+            )
+            if validation_error is not None:
+                error_text.value = validation_error
+                self._safely_update_page()
+                return
+
+            try:
+                peers_dir = await self._resolve_peers_directory()
+                saved_filename = f"public_{self._sanitize_identity_name(name_raw)}.json"
+                saved_path = peers_dir / saved_filename
+                # Pretty-print so the saved file matches the rest of
+                # the persisted public-key format.
+                normalised_json = json.dumps(
+                    json.loads(json_raw), indent=2, ensure_ascii=False
+                )
+                await asyncio.to_thread(
+                    saved_path.write_text, normalised_json + "\n"
+                )
+            except OSError as save_error:
+                error_text.value = f"Could not save: {save_error}"
+                self._safely_update_page()
+                return
+            except Exception as save_error:  # noqa: BLE001 — surface to UI
+                error_text.value = f"Could not save: {save_error}"
+                self._safely_update_page()
+                return
+
+            self._app_state.peer_public_key_path = saved_path
+            self._peer_public_key_path_text.value = self._format_path_for_display(
+                saved_path
+            )
+            await self._populate_peer_key_history()
+            self._saved_peer_keys_dropdown.value = str(saved_path)
+            _close_dialog()
+            self._safely_show_snackbar(
+                f"Saved peer key as {saved_filename}"
+            )
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Paste peer's public key"),
+            content=ft.Container(
+                width=560,
+                content=ft.Column(
+                    tight=True,
+                    spacing=10,
+                    scroll=ft.ScrollMode.AUTO,
+                    controls=[
+                        ft.Text(
+                            "Use this when the peer sent you the public-key"
+                            " JSON via a messenger and you don't want to save"
+                            " it to a file first. The text below should match"
+                            " the format shown in the peer's Export Public Key"
+                            " dialog.",
+                            size=12,
+                            color=ft.Colors.ON_SURFACE_VARIANT,
+                            no_wrap=False,
+                        ),
+                        name_field,
+                        json_field,
+                        error_text,
+                    ],
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=_on_cancel),
+                ft.FilledButton(
+                    content="Save",
+                    icon=ft.Icons.SAVE,
+                    on_click=_on_save,
+                ),
+            ],
+        )
+        page.show_dialog(dialog)
+
+    @staticmethod
+    def _validate_pasted_peer_key(name: str, json_raw: str) -> Optional[str]:
+        """Sanity-check the inputs to the paste-peer-key dialog.
+
+        Returns ``None`` on success, otherwise a short user-friendly
+        error string suitable for inline display next to the form.
+        """
+        if not name:
+            return "Please provide a name for the saved file."
+        if not json_raw:
+            return "Paste the public-key JSON here."
+        try:
+            parsed = json.loads(json_raw)
+        except json.JSONDecodeError as decode_error:
+            return f"Invalid JSON: {decode_error.msg}"
+        if not isinstance(parsed, dict):
+            return "JSON must be an object with the public-key fields."
+        missing_keys: list[str] = [
+            required_key
+            for required_key in (
+                "version",
+                "curve",
+                "x_coordinate_hex",
+                "y_coordinate_hex",
+            )
+            if required_key not in parsed
+        ]
+        if missing_keys:
+            return f"Missing required field(s): {', '.join(missing_keys)}."
+        return None
+
+    @staticmethod
+    def _sanitize_identity_name(raw_name: str) -> str:
+        """Strip filesystem-hostile characters from a user-supplied name."""
+        safe_chars = "".join(
+            ch if (ch.isalnum() or ch in "-_") else "_"
+            for ch in raw_name.strip()
+        )
+        return safe_chars or "peer"
 
     async def _try_save_to_public_downloads(
         self, public_key_path: Path, public_key_name: str
@@ -966,10 +1136,20 @@ class ConnectionView:
             error=False,
         )
         self._set_in_progress(False)
-        # render_view now builds-before-clearing — if build_chat_view
-        # ever raises (e.g. missing connection invariant), the user
-        # stays on this view and sees the error rather than a blank page.
-        self._app_state.render_view(build_chat_view)
+        # render_view builds-before-clearing — if build_chat_view ever
+        # raises (e.g. missing connection invariant or a Flet-Android
+        # widget hiccup), the user stays on this view *and* sees the
+        # error: render_view surfaces a SnackBar, we catch the re-raise
+        # and update the inline status text too.
+        try:
+            self._app_state.render_view(build_chat_view)
+        except Exception as render_error:  # noqa: BLE001 — surface to UI
+            self._show_status(
+                f"Could not open chat view: {render_error}", error=True
+            )
+            self._safely_show_snackbar(
+                f"Could not open chat view: {render_error}"
+            )
 
     async def _perform_handshake_action(
         self,
@@ -1111,6 +1291,7 @@ class ConnectionView:
         self._cancel_button.visible = in_progress
         self._generate_identity_button.disabled = in_progress
         self._export_public_key_button.disabled = in_progress
+        self._paste_peer_key_button.disabled = in_progress
         self._progress_indicator.visible = in_progress
         self._safely_update_page()
 
