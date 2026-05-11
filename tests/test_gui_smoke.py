@@ -131,6 +131,113 @@ def test_chat_view_appends_chat_entry_renders_a_bubble() -> None:
     last_entry: ChatEntry = chat_view._chat_entries[-1]  # type: ignore[attr-defined]
     assert last_entry.sender == "self"
     assert last_entry.text == "hello"
+    # Plain text entries don't carry a file_path.
+    assert last_entry.file_path is None
+
+
+def test_chat_entry_default_file_path_is_none() -> None:
+    """ChatEntry's file_path defaults to None for non-file messages."""
+    import datetime as _dt
+
+    entry = ChatEntry(timestamp=_dt.datetime.now(), sender="self", text="hi")
+    assert entry.file_path is None
+
+
+def test_chat_entry_carries_file_path_when_provided(tmp_path: Path) -> None:
+    """ChatEntry round-trips an explicit file_path via the constructor."""
+    import datetime as _dt
+
+    sample = tmp_path / "demo.txt"
+    sample.write_text("ok")
+    entry = ChatEntry(
+        timestamp=_dt.datetime.now(),
+        sender="peer",
+        text=f"📎 {sample.name} (2 B)",
+        file_path=sample,
+    )
+    assert entry.file_path == sample
+
+
+def test_append_chat_entry_with_file_path_threads_it_onto_entry(
+    tmp_path: Path,
+) -> None:
+    """_append_chat_entry forwards file_path into the stored ChatEntry."""
+    state = AppState(page=_build_mock_page())
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    from gui.chat_view import ChatView
+
+    chat_view = ChatView(state)
+    chat_view.build()
+    sample = tmp_path / "received.bin"
+    sample.write_bytes(b"x" * 16)
+
+    chat_view._append_chat_entry(  # type: ignore[attr-defined]
+        "peer",
+        f"📎 {sample.name} (16 B)",
+        file_path=sample,
+    )
+    last_entry: ChatEntry = chat_view._chat_entries[-1]  # type: ignore[attr-defined]
+    assert last_entry.file_path == sample
+
+
+def test_render_chat_entry_attaches_on_click_for_file_bubbles(
+    tmp_path: Path,
+) -> None:
+    """File-attachment bubbles render with on_click + ink so they're tappable.
+
+    Non-file bubbles must not have on_click set, otherwise plain text
+    messages would surface a stray ripple effect.
+    """
+    import datetime as _dt
+
+    state = AppState(page=_build_mock_page())
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    from gui.chat_view import ChatView
+
+    chat_view = ChatView(state)
+    chat_view.build()
+
+    plain_entry = ChatEntry(
+        timestamp=_dt.datetime.now(), sender="self", text="just text"
+    )
+    plain_row = chat_view._render_chat_entry(plain_entry)  # type: ignore[attr-defined]
+    plain_container = plain_row.controls[0]  # type: ignore[attr-defined]
+    assert plain_container.on_click is None
+    assert plain_container.ink is False
+
+    sample = tmp_path / "att.json"
+    sample.write_text("{}")
+    file_entry = ChatEntry(
+        timestamp=_dt.datetime.now(),
+        sender="peer",
+        text=f"📎 {sample.name} (2 B)",
+        file_path=sample,
+    )
+    file_row = chat_view._render_chat_entry(file_entry)  # type: ignore[attr-defined]
+    file_container = file_row.controls[0]  # type: ignore[attr-defined]
+    assert callable(file_container.on_click)
+    assert file_container.ink is True
+    assert file_container.tooltip is not None
+
+
+def test_show_file_options_dialog_attaches_dialog_to_page(
+    tmp_path: Path,
+) -> None:
+    """_show_file_options_dialog hands an AlertDialog to page.show_dialog."""
+    state = AppState(page=_build_mock_page())
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    from gui.chat_view import ChatView
+
+    chat_view = ChatView(state)
+    chat_view.build()
+    sample = tmp_path / "att.json"
+    sample.write_text("{}")
+    chat_view._show_file_options_dialog(sample)  # type: ignore[attr-defined]
+    state.page.show_dialog.assert_called_once()  # type: ignore[attr-defined]
+    dialog_arg = state.page.show_dialog.call_args.args[0]  # type: ignore[attr-defined]
+    assert isinstance(dialog_arg, flet.AlertDialog)
+    # Three primary actions + Close = four buttons.
+    assert len(dialog_arg.actions) == 4
 
 
 def test_render_view_calls_page_update_exactly_once() -> None:
