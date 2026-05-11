@@ -17,7 +17,7 @@ fixture.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -636,3 +636,119 @@ def test_register_shared_file_picker_uses_page_services_not_overlay() -> None:
     assert fake_page.overlay == []
     # Picker MUST have been registered with the services registry.
     assert picker in fake_page.services._services  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Endpoint memoisation (host / port persisted across sessions)
+# ---------------------------------------------------------------------------
+
+
+def _build_mock_page_with_client_storage(
+    stored_host: object = None, stored_port: object = None
+) -> object:
+    """Mock page whose client_storage.get_async returns the supplied values.
+
+    A bare ``MagicMock(spec=flet.Page)`` makes ``await page.client_storage.
+    get_async(...)`` fail because MagicMock is not awaitable; spec=Page
+    leaves attribute access to ``client_storage`` as a regular child
+    MagicMock with no async surface. Real-app code does ``await
+    page.client_storage.get_async(key)``, so we install ``AsyncMock``s.
+    """
+    page = _build_mock_page()
+    fake_storage = MagicMock()
+    fake_storage.get_async = AsyncMock(
+        side_effect=lambda key: (
+            stored_host
+            if "last_host" in key
+            else stored_port
+            if "last_port" in key
+            else None
+        )
+    )
+    fake_storage.set_async = AsyncMock(return_value=True)
+    page.client_storage = fake_storage  # type: ignore[attr-defined]
+    return page
+
+
+async def test_restore_last_endpoint_prefills_default_host_and_port() -> None:
+    """If client_storage has values and the fields hold the defaults,
+    _restore_last_endpoint overwrites them."""
+    from gui.connection_view import ConnectionView
+
+    page = _build_mock_page_with_client_storage(
+        stored_host="10.0.0.42", stored_port="8443"
+    )
+    state = AppState(page=page)
+    view = ConnectionView(state)
+    view.build()
+    await view._restore_last_endpoint()  # type: ignore[attr-defined]
+
+    assert view._host_text_field.value == "10.0.0.42"  # type: ignore[attr-defined]
+    assert view._port_text_field.value == "8443"  # type: ignore[attr-defined]
+
+
+async def test_restore_last_endpoint_keeps_user_edits_intact() -> None:
+    """If the user already typed a custom value (not the default),
+    _restore_last_endpoint must not clobber it."""
+    from gui.connection_view import ConnectionView
+
+    page = _build_mock_page_with_client_storage(
+        stored_host="10.0.0.42", stored_port="8443"
+    )
+    state = AppState(page=page)
+    view = ConnectionView(state)
+    view.build()
+    # Simulate the user typing a custom IP before storage finished.
+    view._host_text_field.value = "192.168.1.5"  # type: ignore[attr-defined]
+    view._port_text_field.value = "5555"  # type: ignore[attr-defined]
+    await view._restore_last_endpoint()  # type: ignore[attr-defined]
+
+    assert view._host_text_field.value == "192.168.1.5"  # type: ignore[attr-defined]
+    assert view._port_text_field.value == "5555"  # type: ignore[attr-defined]
+
+
+async def test_restore_last_endpoint_silently_handles_missing_storage() -> None:
+    """If client_storage is unavailable / errors, _restore_last_endpoint
+    must not raise — the fields just keep their defaults."""
+    from gui.connection_view import ConnectionView
+
+    state = AppState(page=_build_mock_page())  # no client_storage configured
+    view = ConnectionView(state)
+    view.build()
+    # Default mock page returns MagicMock for .client_storage and .get_async,
+    # which raises when awaited. The helper should swallow.
+    await view._restore_last_endpoint()  # type: ignore[attr-defined]
+    assert view._host_text_field.value == "127.0.0.1"  # type: ignore[attr-defined]
+    assert view._port_text_field.value == "9000"  # type: ignore[attr-defined]
+
+
+async def test_persist_endpoint_writes_host_and_port_to_client_storage() -> None:
+    """_persist_endpoint calls set_async twice with the configured keys."""
+    from gui.connection_view import (
+        ConnectionView,
+        _CLIENT_STORAGE_LAST_HOST_KEY,
+        _CLIENT_STORAGE_LAST_PORT_KEY,
+    )
+
+    page = _build_mock_page_with_client_storage()
+    state = AppState(page=page)
+    view = ConnectionView(state)
+    view.build()
+
+    await view._persist_endpoint("10.0.0.42", 8443)  # type: ignore[attr-defined]
+
+    set_async = page.client_storage.set_async  # type: ignore[attr-defined]
+    set_async.assert_any_await(_CLIENT_STORAGE_LAST_HOST_KEY, "10.0.0.42")
+    set_async.assert_any_await(_CLIENT_STORAGE_LAST_PORT_KEY, "8443")
+    assert set_async.await_count == 2
+
+
+async def test_persist_endpoint_swallows_storage_failures() -> None:
+    """A storage failure must never propagate — preferences are best-effort."""
+    from gui.connection_view import ConnectionView
+
+    state = AppState(page=_build_mock_page())  # no real client_storage
+    view = ConnectionView(state)
+    view.build()
+    # Should not raise even though awaiting a regular MagicMock would.
+    await view._persist_endpoint("10.0.0.42", 8443)  # type: ignore[attr-defined]
