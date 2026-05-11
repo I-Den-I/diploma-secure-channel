@@ -93,12 +93,24 @@ class AppState:
     def render_view(self, view_builder: ViewBuilder) -> None:
         """Replace the page's contents with the output of ``view_builder``.
 
+        Builds the new root control **before** clearing the existing
+        controls. If the builder raises (e.g. ``ChatView.__init__``
+        rejects a missing ``secure_connection``), the current view
+        stays visible so the user keeps seeing whatever error / state
+        led to the failed transition rather than being stranded on a
+        blank / gray page. Fixes a regression where a failed
+        connection-attempt → chat-view transition produced an empty
+        screen on Android.
+
         :param view_builder: Callable returning the root :class:`ft.Control`
             of the new view.
         """
+        # If view_builder raises, none of the mutations below run and
+        # the existing view stays mounted — no gray-screen window.
+        new_root_control: ft.Control = view_builder(self)
         self._current_view_builder = view_builder
         self.page.controls.clear()
-        self.page.controls.append(view_builder(self))
+        self.page.controls.append(new_root_control)
         self.page.update()
 
     async def shutdown_active_session(self) -> None:

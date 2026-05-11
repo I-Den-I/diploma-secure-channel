@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 from pathlib import Path
-from typing import Final, Optional
+from typing import Any, Final, Optional
 
 import flet as ft
 
@@ -73,15 +73,21 @@ class ConnectionView:
         "_status_text",
         "_progress_indicator",
         "_primary_action_button",
+        "_cancel_button",
         "_generate_identity_button",
         "_identity_name_text_field",
         "_export_public_key_button",
         "_in_progress",
+        "_pending_action_task",
     )
 
     def __init__(self, app_state: AppState) -> None:
         self._app_state: Final[AppState] = app_state
         self._in_progress: bool = False
+        # Reference to the in-flight connect/listen Task so the Cancel
+        # button can abort it via task.cancel(). Cleared back to None
+        # whenever the action settles (success / cancel / error).
+        self._pending_action_task: Optional[asyncio.Task[Any]] = None
 
         # The connection view does **not** create its own
         # ``ft.FilePicker``: a single shared instance is registered on
@@ -169,6 +175,17 @@ class ConnectionView:
             content="Connect",
             icon=ft.Icons.LOCK_OPEN,
             on_click=self._handle_primary_action_click,
+        )
+        # Visible only while a connect/listen task is in flight; clicking
+        # it calls _handle_cancel_click → task.cancel(). Red accent so
+        # the user can spot the abort affordance instantly.
+        self._cancel_button = ft.OutlinedButton(
+            content="Cancel",
+            icon=ft.Icons.CANCEL,
+            icon_color=ft.Colors.RED_400,
+            on_click=self._handle_cancel_click,
+            visible=False,
+            style=ft.ButtonStyle(color=ft.Colors.RED_400),
         )
         self._generate_identity_button = ft.OutlinedButton(
             content="Generate New Identity",
@@ -349,6 +366,7 @@ class ConnectionView:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
                         self._primary_action_button,
+                        self._cancel_button,
                         self._progress_indicator,
                     ],
                 ),
@@ -882,25 +900,29 @@ class ConnectionView:
             )
             return
 
+        is_server: bool = self._is_server_role_selected()
+
+        # Wrap the actual connect/listen in a Task so the Cancel button
+        # has something to call .cancel() on. Without this, the await
+        # below sits inside the on_click coroutine and there's no
+        # external handle to abort it.
+        self._pending_action_task = asyncio.create_task(
+            self._perform_handshake_action(
+                credentials=credentials,
+                host=host_value,
+                port=port_value,
+                is_server=is_server,
+            )
+        )
+
+        connection: Optional[SecureChannelConnection] = None
         try:
-            if self._is_server_role_selected():
-                self._show_status(
-                    f"Listening on {host_value}:{port_value} for an incoming peer..."
-                )
-                connection = await self._listen_and_handoff(
-                    credentials=credentials,
-                    bind_host=host_value,
-                    bind_port=port_value,
-                )
-            else:
-                self._show_status(
-                    f"Connecting to {host_value}:{port_value} ..."
-                )
-                connection = await connect_secure_channel(
-                    host=host_value,
-                    port=port_value,
-                    credentials=credentials,
-                )
+            connection = await self._pending_action_task
+        except asyncio.CancelledError:
+            await self._tear_down_partial_listen_state()
+            self._show_status("Cancelled.", error=False)
+            self._set_in_progress(False)
+            return
         except HandshakeError as handshake_error:
             self._set_in_progress(False)
             self._show_status(
@@ -910,26 +932,16 @@ class ConnectionView:
         except ConnectionRefusedError:
             self._set_in_progress(False)
             self._show_status("Connection refused.", error=True)
-            self._app_state.page.show_dialog(
-                ft.SnackBar(
-                    content=ft.Text(
-                        "Connection refused (Errno 111): Check the target IP"
-                        " and ensure the server is listening."
-                    ),
-                    duration=6000,
-                )
+            self._safely_show_snackbar(
+                "Connection refused (Errno 111): Check the target IP"
+                " and ensure the server is listening."
             )
             return
         except (TimeoutError, asyncio.TimeoutError):
             self._set_in_progress(False)
             self._show_status("Connection timed out.", error=True)
-            self._app_state.page.show_dialog(
-                ft.SnackBar(
-                    content=ft.Text(
-                        "Connection timed out. Check the target IP and port."
-                    ),
-                    duration=6000,
-                )
+            self._safely_show_snackbar(
+                "Connection timed out. Check the target IP and port."
             )
             return
         except OSError as transport_error:
@@ -944,14 +956,98 @@ class ConnectionView:
                 f"Unexpected error: {unexpected_error}", error=True
             )
             return
+        finally:
+            self._pending_action_task = None
 
+        assert connection is not None  # narrowed by the try/except above
         self._app_state.secure_connection = connection
         self._show_status(
             f"Connection established with {connection.peer_address}.",
             error=False,
         )
         self._set_in_progress(False)
+        # render_view now builds-before-clearing — if build_chat_view
+        # ever raises (e.g. missing connection invariant), the user
+        # stays on this view and sees the error rather than a blank page.
         self._app_state.render_view(build_chat_view)
+
+    async def _perform_handshake_action(
+        self,
+        *,
+        credentials: object,
+        host: str,
+        port: int,
+        is_server: bool,
+    ) -> SecureChannelConnection:
+        """Run the actual connect / listen call as a cancellable Task.
+
+        Extracted out of :meth:`_handle_primary_action_click` so the
+        click handler can hold a Task reference and the Cancel button
+        can abort it via ``task.cancel()``.
+        """
+        if is_server:
+            self._show_status(
+                f"Listening on {host}:{port} for an incoming peer..."
+            )
+            return await self._listen_and_handoff(
+                credentials=credentials,
+                bind_host=host,
+                bind_port=port,
+            )
+        self._show_status(f"Connecting to {host}:{port} ...")
+        return await connect_secure_channel(
+            host=host,
+            port=port,
+            credentials=credentials,
+        )
+
+    async def _tear_down_partial_listen_state(self) -> None:
+        """Close any half-started listening server during a cancel.
+
+        :meth:`_listen_and_handoff` parks a server on the asyncio loop
+        and stashes it on :class:`AppState`. If the user cancels
+        *before* a peer connects, that server is still bound to the
+        port — we shut it down here so the next Listen attempt can
+        re-bind cleanly.
+        """
+        if self._app_state.server_shutdown_event is not None:
+            self._app_state.server_shutdown_event.set()
+            self._app_state.server_shutdown_event = None
+        if self._app_state.secure_server is not None:
+            try:
+                await self._app_state.secure_server.close()
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+            self._app_state.secure_server = None
+
+    def _handle_cancel_click(self, event: ft.ControlEvent) -> None:
+        """Abort the in-flight connect/listen Task on user request.
+
+        Sync handler — just calls ``task.cancel()`` and returns. The
+        cancellation is observed by the awaiting
+        :meth:`_handle_primary_action_click`, which performs the actual
+        UI / state cleanup in its ``except CancelledError`` branch.
+        """
+        if self._pending_action_task is None:
+            return
+        if self._pending_action_task.done():
+            return
+        self._pending_action_task.cancel()
+        # Give the user immediate visual feedback even before the
+        # awaiting handler runs its cleanup branch.
+        self._show_status("Cancelling...", error=False)
+
+    def _safely_show_snackbar(self, message: str) -> None:
+        """Display an error SnackBar tolerating mid-render races."""
+        try:
+            self._app_state.page.show_dialog(
+                ft.SnackBar(
+                    content=ft.Text(message),
+                    duration=6000,
+                )
+            )
+        except Exception:  # noqa: BLE001 — SnackBar is best-effort
+            pass
 
     # ------------------------------------------------------------------
     # Server-side listen helper
@@ -1012,17 +1108,29 @@ class ConnectionView:
     def _set_in_progress(self, in_progress: bool) -> None:
         self._in_progress = in_progress
         self._primary_action_button.disabled = in_progress
+        self._cancel_button.visible = in_progress
         self._generate_identity_button.disabled = in_progress
         self._export_public_key_button.disabled = in_progress
         self._progress_indicator.visible = in_progress
-        self._app_state.page.update()
+        self._safely_update_page()
+
+    def _safely_update_page(self) -> None:
+        """Call ``page.update()`` and swallow shutdown-time races.
+
+        Used by error / cancel paths where the page may be mid-render.
+        Prevents a teardown race from masking the real status message.
+        """
+        try:
+            self._app_state.page.update()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _show_status(self, status_message: str, *, error: bool = False) -> None:
         self._status_text.value = status_message
         self._status_text.color = (
             ft.Colors.ERROR if error else ft.Colors.ON_SURFACE_VARIANT
         )
-        self._app_state.page.update()
+        self._safely_update_page()
 
     @staticmethod
     def _format_path_for_display(file_path: Optional[Path]) -> str:
