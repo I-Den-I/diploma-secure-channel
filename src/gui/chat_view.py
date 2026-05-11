@@ -367,73 +367,38 @@ class ChatView:
     def _build_mobile_header(self) -> ft.Control:
         """Compact header tailored for narrow phone screens.
 
-        Inline buttons (theme / log toggle / Disconnect) overflow the
-        viewport on Android and get clipped — half of them disappear
-        completely. Move them into a 3-dot popup menu so the title and
-        secure-session chip always fit, and stack the metadata fields
-        vertically so the long peer-address line wraps cleanly.
+        The previous version of this method tried to fold the action
+        buttons into an ``ft.PopupMenuButton``. On Flet 0.84 / Android
+        the popup-menu trigger raised during view construction, which
+        ate the entire chat-view transition (the user saw
+        "Connection established" but no chat appeared — see the
+        regression report on PR #19).
+
+        Replaced with a wrapping ``ft.Row`` of plain ``ft.IconButton``s
+        — exactly the same control types the desktop header uses, just
+        permitted to wrap when narrow. No platform-specific widgets, no
+        special-cased event plumbing, and no behavioural divergence
+        between mobile and desktop other than line-breaks.
         """
         peer_address_label: str = self._format_peer_address_for_display()
         role_label: str = self._format_role_for_display()
-        overflow_menu = ft.PopupMenuButton(
-            icon=ft.Icons.MORE_VERT,
-            tooltip="More",
-            items=[
-                ft.PopupMenuItem(
-                    icon=ft.Icons.BUG_REPORT,
-                    text="Simulate tamper (next message)",
-                    on_click=self._handle_tamper_click,
-                ),
-                ft.PopupMenuItem(
-                    icon=ft.Icons.DOWNLOAD,
-                    text="Export logs (JSON)",
-                    on_click=self._handle_export_logs_click,
-                ),
-                ft.PopupMenuItem(
-                    icon=ft.Icons.TERMINAL,
-                    text="Toggle log panel",
-                    on_click=self._handle_logs_visibility_toggle,
-                ),
-                ft.PopupMenuItem(
-                    icon=self._select_theme_toggle_icon(),
-                    text="Toggle theme",
-                    on_click=self._handle_theme_toggle_click,
-                ),
-                ft.PopupMenuItem(
-                    icon=ft.Icons.LOGOUT,
-                    text="Disconnect",
-                    on_click=self._handle_disconnect_click,
-                ),
-            ],
-        )
         return ft.Column(
             tight=True,
             spacing=4,
             controls=[
                 ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
-                        ft.Row(
-                            spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Icon(
-                                    icon=ft.Icons.SHIELD_OUTLINED,
-                                    color=ft.Colors.PRIMARY,
-                                    size=22,
-                                ),
-                                ft.Text(
-                                    value="Secure channel",
-                                    size=16,
-                                    weight=ft.FontWeight.W_600,
-                                ),
-                            ],
+                        ft.Icon(
+                            icon=ft.Icons.SHIELD_OUTLINED,
+                            color=ft.Colors.PRIMARY,
+                            size=22,
                         ),
-                        ft.Row(
-                            spacing=4,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[self._status_chip, overflow_menu],
+                        ft.Text(
+                            value="Secure channel",
+                            size=16,
+                            weight=ft.FontWeight.W_600,
                         ),
                     ],
                 ),
@@ -454,6 +419,22 @@ class ChatView:
                     size=11,
                     color=ft.Colors.ON_SURFACE_VARIANT,
                     no_wrap=False,
+                ),
+                # All actions on one wrap=True row → guarantees nothing
+                # gets clipped on narrow screens and every control type
+                # is one Flet already renders on Android.
+                ft.Row(
+                    spacing=6,
+                    wrap=True,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        self._status_chip,
+                        self._tamper_button,
+                        self._export_logs_button,
+                        self._logs_visibility_button,
+                        self._theme_toggle_button,
+                        self._disconnect_button,
+                    ],
                 ),
             ],
         )
@@ -531,18 +512,34 @@ class ChatView:
     # ------------------------------------------------------------------
 
     def _render_initial_system_log_entries(self) -> None:
-        """Seed the log panel with the events known at view-mount time."""
+        """Seed the log panel with the events known at view-mount time.
+
+        Called from :meth:`build` *before* the new root control is
+        appended to the page. Using the regular
+        :meth:`_append_system_log_entry` (which calls
+        :meth:`_safely_update_page`) here would trigger one
+        ``page.update()`` per entry on a tree that isn't mounted yet
+        — wasted work on desktop and a documented source of black-screen
+        renders on Flet 0.84 / Android. We seed the cache + listview
+        directly, then let the caller's single post-build
+        ``render_view`` -> ``page.update()`` paint everything once.
+        """
         if self._system_log_entries:
             return  # already populated (e.g. theme toggle re-renders)
-        self._append_system_log_entry(
-            "info", "Handshake completed (DSTU 4145 mutual auth)"
-        )
-        self._append_system_log_entry(
-            "info", "Session keys derived (Kalyna(128, 256) AEAD x 2)"
-        )
-        self._append_system_log_entry(
-            "info", f"Receiver freshness window armed; replay window enabled"
-        )
+        for seed_message in (
+            "Handshake completed (DSTU 4145 mutual auth)",
+            "Session keys derived (Kalyna(128, 256) AEAD x 2)",
+            "Receiver freshness window armed; replay window enabled",
+        ):
+            entry = SystemLogEntry(
+                timestamp=_datetime.datetime.now(),
+                level="info",
+                message=seed_message,
+            )
+            self._system_log_entries.append(entry)
+            self._logs_listview.controls.append(
+                self._render_system_log_entry(entry)
+            )
 
     def _render_chat_listview_from_cache(self) -> None:
         """Re-build the chat list-view contents from the in-memory cache."""

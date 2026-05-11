@@ -392,6 +392,121 @@ def test_cancel_click_is_a_noop_when_no_action_is_pending() -> None:
     view._handle_cancel_click(MagicMock())  # type: ignore[attr-defined]
 
 
+def test_chat_view_build_does_not_call_page_update_before_mount() -> None:
+    """Regression: ChatView.build() must not call page.update() during construction.
+
+    The previous implementation called ``_append_system_log_entry`` for
+    each of the three seed log entries; ``_append_system_log_entry``
+    calls ``_safely_update_page``. On Flet 0.84 / Android this
+    triggered ``page.update()`` against a control tree that did **not**
+    yet contain ChatView's logs_listview (because ``render_view``
+    appends the new root only after the builder returns). The Android
+    runtime appears to handle that race by leaving the page on the
+    *previous* view, which is exactly what the user reported: the
+    "Connection established" status was visible but the chat view never
+    appeared.
+
+    Pinning this contract: build() should fully populate the in-memory
+    caches and child controls but leave the single ``page.update()``
+    call to the caller (``render_view``).
+    """
+    fake_page = _build_mock_page()
+    update_calls: list[str] = []
+    fake_page.update = lambda: update_calls.append("update")
+    state = AppState(page=fake_page)
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+
+    root = build_chat_view(state)
+    assert isinstance(root, flet.Control)
+    assert update_calls == [], (
+        f"build() called page.update() {len(update_calls)} time(s) before "
+        f"the new view was mounted — this regresses the Android no-chat-view bug."
+    )
+
+
+def test_chat_view_build_seeds_initial_logs_into_listview_controls() -> None:
+    """Seed log entries must be present in the listview even though
+    build() doesn't call page.update() during construction."""
+    state = AppState(page=_build_mock_page())
+    state.secure_connection = _build_mock_secure_connection()  # type: ignore[assignment]
+    from gui.chat_view import ChatView
+
+    chat_view = ChatView(state)
+    chat_view.build()
+    assert len(chat_view._system_log_entries) >= 3  # type: ignore[attr-defined]
+    assert len(chat_view._logs_listview.controls) >= 3  # type: ignore[attr-defined]
+
+
+def test_validate_pasted_peer_key_accepts_correct_schema() -> None:
+    import json as _json
+
+    from gui.connection_view import ConnectionView
+
+    valid_json = _json.dumps(
+        {
+            "version": 1,
+            "curve": "DSTU4145_M163_PB",
+            "x_coordinate_hex": "deadbeef",
+            "y_coordinate_hex": "cafebabe",
+        }
+    )
+    assert ConnectionView._validate_pasted_peer_key("alice", valid_json) is None  # type: ignore[attr-defined]
+
+
+def test_validate_pasted_peer_key_rejects_empty_name() -> None:
+    from gui.connection_view import ConnectionView
+
+    error = ConnectionView._validate_pasted_peer_key("", '{"version": 1}')  # type: ignore[attr-defined]
+    assert error is not None
+    assert "name" in error.lower()
+
+
+def test_validate_pasted_peer_key_rejects_invalid_json() -> None:
+    from gui.connection_view import ConnectionView
+
+    error = ConnectionView._validate_pasted_peer_key("alice", "not json {")  # type: ignore[attr-defined]
+    assert error is not None
+    assert "JSON" in error
+
+
+def test_validate_pasted_peer_key_lists_missing_fields() -> None:
+    from gui.connection_view import ConnectionView
+
+    error = ConnectionView._validate_pasted_peer_key(  # type: ignore[attr-defined]
+        "alice",
+        '{"version": 1, "curve": "DSTU4145_M163_PB"}',
+    )
+    assert error is not None
+    assert "x_coordinate_hex" in error
+    assert "y_coordinate_hex" in error
+
+
+def test_sanitize_identity_name_strips_filesystem_hostile_chars() -> None:
+    from gui.connection_view import ConnectionView
+
+    sanitize = ConnectionView._sanitize_identity_name  # type: ignore[attr-defined]
+    assert sanitize("alice/2024") == "alice_2024"
+    assert sanitize("../etc/passwd") == "___etc_passwd"
+    assert sanitize("") == "peer"
+    assert sanitize("   ") == "peer"
+    assert sanitize("hi-there_42") == "hi-there_42"
+
+
+def test_paste_peer_key_button_disables_during_action() -> None:
+    from gui.connection_view import ConnectionView
+
+    state = AppState(page=_build_mock_page())
+    view = ConnectionView(state)
+    view.build()
+    assert view._paste_peer_key_button.disabled is False  # type: ignore[attr-defined]
+
+    view._set_in_progress(True)  # type: ignore[attr-defined]
+    assert view._paste_peer_key_button.disabled is True  # type: ignore[attr-defined]
+
+    view._set_in_progress(False)  # type: ignore[attr-defined]
+    assert view._paste_peer_key_button.disabled is False  # type: ignore[attr-defined]
+
+
 def test_register_shared_file_picker_uses_page_services_not_overlay() -> None:
     """Regression test for the "Unknown control: FilePicker" red banner.
 
