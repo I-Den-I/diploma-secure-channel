@@ -279,6 +279,119 @@ def test_handle_key_selected_updates_state_and_path_text(
     assert state.own_private_key_path == private_files[0]
 
 
+def test_render_view_keeps_current_view_when_builder_raises() -> None:
+    """Regression: render_view must not blank the page if the builder throws.
+
+    Before the fix, ``render_view`` cleared the page first, then called
+    the builder. A builder failure (e.g. ``ChatView`` rejecting a
+    missing connection) left the page empty — the "gray screen" bug
+    seen on Android after a botched chat-view transition. The fixed
+    implementation builds first and only swaps controls if the build
+    succeeded.
+    """
+    fake_page = _build_mock_page()
+    state = AppState(page=fake_page)
+    state.render_view(build_connection_view)
+    assert len(fake_page.controls) == 1
+    placeholder_root = fake_page.controls[0]
+
+    def deliberately_failing_builder(_state: AppState) -> flet.Control:
+        raise RuntimeError("boom — builder under test")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        state.render_view(deliberately_failing_builder)
+
+    # Critical assertion — the original view must still be mounted.
+    assert len(fake_page.controls) == 1
+    assert fake_page.controls[0] is placeholder_root
+
+
+def test_connection_view_cancel_button_is_hidden_until_in_progress() -> None:
+    """The Cancel button only appears once a connect/listen attempt starts."""
+    from gui.connection_view import ConnectionView
+
+    state = AppState(page=_build_mock_page())
+    view = ConnectionView(state)
+    view.build()
+
+    assert view._cancel_button.visible is False  # type: ignore[attr-defined]
+    assert view._primary_action_button.disabled is False  # type: ignore[attr-defined]
+
+    view._set_in_progress(True)  # type: ignore[attr-defined]
+    assert view._cancel_button.visible is True  # type: ignore[attr-defined]
+    assert view._primary_action_button.disabled is True  # type: ignore[attr-defined]
+    assert view._progress_indicator.visible is True  # type: ignore[attr-defined]
+
+    view._set_in_progress(False)  # type: ignore[attr-defined]
+    assert view._cancel_button.visible is False  # type: ignore[attr-defined]
+    assert view._primary_action_button.disabled is False  # type: ignore[attr-defined]
+    assert view._progress_indicator.visible is False  # type: ignore[attr-defined]
+
+
+async def test_cancel_click_aborts_pending_action_task_and_resets_ui() -> None:
+    """_handle_cancel_click cancels the in-flight task and the awaiter cleans up.
+
+    Simulates the full cancellation flow without standing up a real
+    socket: a long-sleep coroutine stands in for the real connect /
+    listen call so we can verify that pressing Cancel:
+
+    1. cancels the pending task,
+    2. lets the awaiter observe the CancelledError,
+    3. flips the UI back to its idle state (Cancel hidden, primary
+       action re-enabled, status text reads "Cancelled.").
+    """
+    import asyncio
+
+    from gui.connection_view import ConnectionView
+
+    state = AppState(page=_build_mock_page())
+    view = ConnectionView(state)
+    view.build()
+
+    async def fake_long_running_action() -> None:
+        await asyncio.sleep(60)
+
+    view._set_in_progress(True)  # type: ignore[attr-defined]
+    view._pending_action_task = asyncio.create_task(  # type: ignore[attr-defined]
+        fake_long_running_action()
+    )
+
+    # Run the awaiter side of _handle_primary_action_click in parallel.
+    async def awaiter_side() -> None:
+        try:
+            await view._pending_action_task  # type: ignore[attr-defined]
+        except asyncio.CancelledError:
+            view._show_status("Cancelled.", error=False)  # type: ignore[attr-defined]
+            view._set_in_progress(False)  # type: ignore[attr-defined]
+
+    awaiter_task = asyncio.create_task(awaiter_side())
+    await asyncio.sleep(0)  # let the awaiter actually start awaiting
+
+    # User clicks Cancel.
+    view._handle_cancel_click(MagicMock())  # type: ignore[attr-defined]
+    await asyncio.wait_for(awaiter_task, timeout=2.0)
+
+    assert view._in_progress is False  # type: ignore[attr-defined]
+    assert view._cancel_button.visible is False  # type: ignore[attr-defined]
+    assert view._primary_action_button.disabled is False  # type: ignore[attr-defined]
+    assert view._status_text.value == "Cancelled."  # type: ignore[attr-defined]
+
+
+def test_cancel_click_is_a_noop_when_no_action_is_pending() -> None:
+    """Pressing Cancel with nothing in flight must not raise."""
+    from gui.connection_view import ConnectionView
+
+    state = AppState(page=_build_mock_page())
+    view = ConnectionView(state)
+    view.build()
+
+    # Pre-condition: nothing pending.
+    assert view._pending_action_task is None  # type: ignore[attr-defined]
+
+    # Should not raise.
+    view._handle_cancel_click(MagicMock())  # type: ignore[attr-defined]
+
+
 def test_register_shared_file_picker_uses_page_services_not_overlay() -> None:
     """Regression test for the "Unknown control: FilePicker" red banner.
 
