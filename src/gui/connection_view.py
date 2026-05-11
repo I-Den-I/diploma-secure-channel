@@ -47,6 +47,13 @@ from secure_channel.session.handshake import HandshakeError
 
 _DEFAULT_HOST_VALUE: Final[str] = "127.0.0.1"
 _DEFAULT_PORT_VALUE: Final[str] = "9000"
+# Keys under which the most-recently-used endpoint is persisted via
+# :class:`flet.ClientStorage`. Pre-fill the host/port fields on next
+# launch so the user does not have to re-type their peer's IP every
+# session. Stored as plain strings so they survive a Flet version
+# upgrade without a schema migration.
+_CLIENT_STORAGE_LAST_HOST_KEY: Final[str] = "dstu_secure_channel.last_host"
+_CLIENT_STORAGE_LAST_PORT_KEY: Final[str] = "dstu_secure_channel.last_port"
 _OWN_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select your private.json"
 _PEER_FILE_PICKER_DIALOG_TITLE: Final[str] = "Select the peer's public.json"
 _MOBILE_PLATFORMS: Final[frozenset[ft.PagePlatform]] = frozenset({
@@ -245,6 +252,10 @@ class ConnectionView:
         # populated once the page's storage-paths service is ready.
         self._app_state.page.run_task(self._populate_key_history)
         self._app_state.page.run_task(self._populate_peer_key_history)
+        # Restore the host / port the user typed during the previous
+        # session so re-launching the app does not require retyping
+        # the peer's IP every time.
+        self._app_state.page.run_task(self._restore_last_endpoint)
         return root
 
     # ------------------------------------------------------------------
@@ -550,6 +561,56 @@ class ConnectionView:
         }:
             self._saved_peer_keys_dropdown.value = str(current_path)
         self._app_state.page.update()
+
+    async def _restore_last_endpoint(self) -> None:
+        """Pre-fill the host / port fields with the previous session's values.
+
+        Looked up under :data:`_CLIENT_STORAGE_LAST_HOST_KEY` /
+        :data:`_CLIENT_STORAGE_LAST_PORT_KEY` in
+        :class:`flet.ClientStorage`. Silently no-ops if storage is
+        unavailable (test harness, very old Flet) or empty (first
+        launch). Skips fields the user has already edited away from
+        the default so we don't clobber mid-session typing — only
+        defaults get overwritten.
+        """
+        try:
+            client_storage = self._app_state.page.client_storage
+            stored_host: Optional[str] = (
+                await client_storage.get_async(_CLIENT_STORAGE_LAST_HOST_KEY)
+            )
+            stored_port: Optional[str] = (
+                await client_storage.get_async(_CLIENT_STORAGE_LAST_PORT_KEY)
+            )
+        except Exception:  # noqa: BLE001 — storage not ready / unsupported
+            return
+
+        host_was_default: bool = self._host_text_field.value in (
+            _DEFAULT_HOST_VALUE,
+            "0.0.0.0",
+        )
+        port_was_default: bool = self._port_text_field.value == _DEFAULT_PORT_VALUE
+        anything_changed: bool = False
+        if stored_host and host_was_default:
+            self._host_text_field.value = stored_host
+            anything_changed = True
+        if stored_port and port_was_default:
+            self._port_text_field.value = stored_port
+            anything_changed = True
+        if anything_changed:
+            self._safely_update_page()
+
+    async def _persist_endpoint(self, host: str, port: int) -> None:
+        """Save the current endpoint to client_storage for next session.
+
+        Best-effort: any storage failure is swallowed because failing
+        to persist preferences must never block a connection attempt.
+        """
+        try:
+            client_storage = self._app_state.page.client_storage
+            await client_storage.set_async(_CLIENT_STORAGE_LAST_HOST_KEY, host)
+            await client_storage.set_async(_CLIENT_STORAGE_LAST_PORT_KEY, str(port))
+        except Exception:  # noqa: BLE001 — preferences are best-effort
+            pass
 
     def _handle_peer_key_selected(self, event: ft.ControlEvent) -> None:
         """Load a peer public key chosen from the saved-peer-keys dropdown."""
@@ -1071,6 +1132,12 @@ class ConnectionView:
             return
 
         is_server: bool = self._is_server_role_selected()
+
+        # Persist the endpoint *before* launching the handshake task,
+        # so the next session pre-fills these values even when the
+        # current attempt fails (Errno 111, timeout, …). Validation
+        # passed → these are sane values worth remembering.
+        await self._persist_endpoint(host_value, port_value)
 
         # Wrap the actual connect/listen in a Task so the Cancel button
         # has something to call .cancel() on. Without this, the await
