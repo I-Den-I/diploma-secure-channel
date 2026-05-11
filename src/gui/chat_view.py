@@ -84,6 +84,12 @@ class ChatEntry:
     :param metrics: Per-message crypto stats (encryption time, sealed
         size). ``None`` for non-payload entries (system notices,
         tamper records that never decrypted successfully).
+    :param file_path: Filesystem path of the attached file, if this is
+        a file-transfer bubble. Set for both outgoing (source path)
+        and incoming (destination path) attachments. ``None`` for
+        plain text messages and system notices. When set, the bubble
+        renders as a clickable affordance that opens an
+        Open-file / Show-folder / Copy-path dialog.
     """
 
     timestamp: _datetime.datetime
@@ -91,6 +97,7 @@ class ChatEntry:
     text: str
     verified: bool = True
     metrics: Optional[MessageMetrics] = None
+    file_path: Optional[Path] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,8 +561,7 @@ class ChatView:
             for entry in self._system_log_entries
         ]
 
-    @staticmethod
-    def _render_chat_entry(entry: ChatEntry) -> ft.Control:
+    def _render_chat_entry(self, entry: ChatEntry) -> ft.Control:
         timestamp_label: str = entry.timestamp.strftime("%H:%M:%S")
         if entry.sender == "system":
             return ft.Container(
@@ -634,6 +640,24 @@ class ChatView:
                 )
             )
 
+        # File-attachment bubbles get an on_click that opens the
+        # Open / Show-folder / Copy-path dialog. Capture file_path in
+        # the lambda's default-arg slot so re-renders don't share a
+        # late-binding closure (each bubble has its own path).
+        bubble_on_click = None
+        bubble_tooltip: Optional[str] = None
+        if entry.file_path is not None:
+            captured_file_path: Path = entry.file_path
+
+            def _open_file_options(
+                _event: ft.ControlEvent,
+                _path: Path = captured_file_path,
+            ) -> None:
+                self._show_file_options_dialog(_path)
+
+            bubble_on_click = _open_file_options
+            bubble_tooltip = "Tap to open / show in folder / copy path"
+
         return ft.Row(
             alignment=ft.MainAxisAlignment.END if is_self else ft.MainAxisAlignment.START,
             controls=[
@@ -654,6 +678,9 @@ class ChatView:
                         ),
                         controls=bubble_children,
                     ),
+                    on_click=bubble_on_click,
+                    tooltip=bubble_tooltip,
+                    ink=bubble_on_click is not None,
                 ),
             ],
         )
@@ -704,12 +731,14 @@ class ChatView:
         *,
         verified: bool = True,
         metrics: Optional[MessageMetrics] = None,
+        file_path: Optional[Path] = None,
     ) -> None:
         entry = ChatEntry(
             timestamp=_datetime.datetime.now(),
             sender=sender,
             text=text,
             verified=verified,
+            file_path=file_path,
             metrics=metrics,
         )
         self._chat_entries.append(entry)
@@ -855,6 +884,7 @@ class ChatView:
         self._append_chat_entry(
             "peer",
             f"📎 {destination_file_path.name} ({size_label})",
+            file_path=destination_file_path,
         )
         self._append_system_log_entry(
             "info",
@@ -1016,7 +1046,9 @@ class ChatView:
             return
         size_label: str = self._format_byte_count(file_byte_length)
         self._append_chat_entry(
-            "self", f"📎 {file_path.name} ({size_label})"
+            "self",
+            f"📎 {file_path.name} ({size_label})",
+            file_path=file_path,
         )
         self._append_system_log_entry(
             "info",
@@ -1053,6 +1085,122 @@ class ChatView:
         await self._cancel_background_receive_loop()
         await self._app_state.shutdown_active_session()
         self._app_state.render_view(lambda state: ConnectionView(state).build())
+
+    def _show_file_options_dialog(self, file_path: Path) -> None:
+        """Show an Open / Show-folder / Copy-path modal for a file bubble.
+
+        Tapping a file-attachment chat bubble routes here. The dialog
+        is the cross-platform escape hatch from "the file is on disk
+        somewhere but how do I open it?":
+
+        - **Open file** — :meth:`flet.Page.launch_url` with the
+          ``file://`` URI. Hands off to the OS default handler on
+          desktop (Preview, TextEdit, …). On Android this may fail
+          (FileUriExposedException for non-FileProvider URIs); the
+          failure is caught and a SnackBar nudges the user to use
+          *Copy path* + a file manager.
+        - **Show in folder** — same trick but with the parent dir.
+          Lets the user reveal the file in Finder / file-manager
+          even when the OS refuses to open the file directly.
+        - **Copy path** — last resort that always works: drops the
+          absolute path on the clipboard so the user can paste it
+          into a file manager / terminal.
+
+        File existence is *not* re-validated here — the file may have
+        been moved between save and click; if launch_url fails the
+        SnackBar surfaces the OS error verbatim.
+        """
+        page = self._app_state.page
+
+        def _close() -> None:
+            dialog.open = False
+            self._safely_update_page()
+
+        def _on_open_file(_event: ft.ControlEvent) -> None:
+            try:
+                page.launch_url(file_path.as_uri())
+            except Exception as exc:  # noqa: BLE001 — surface to user
+                self._append_system_log_entry(
+                    "warn", f"Could not open file: {exc}"
+                )
+                self._show_snackbar(
+                    f"Could not open file: {exc}. Try 'Copy path' instead."
+                )
+            _close()
+
+        def _on_open_folder(_event: ft.ControlEvent) -> None:
+            try:
+                page.launch_url(file_path.parent.as_uri())
+            except Exception as exc:  # noqa: BLE001 — surface to user
+                self._append_system_log_entry(
+                    "warn", f"Could not open folder: {exc}"
+                )
+                self._show_snackbar(
+                    f"Could not open folder: {exc}. Try 'Copy path' instead."
+                )
+            _close()
+
+        async def _on_copy_path(_event: ft.ControlEvent) -> None:
+            try:
+                await page.set_clipboard_async(str(file_path))
+            except Exception:  # noqa: BLE001 — fall back to sync API
+                page.set_clipboard(str(file_path))
+            self._show_snackbar(f"Copied to clipboard: {file_path.name}")
+            _close()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(file_path.name, size=15, weight=ft.FontWeight.W_600),
+            content=ft.Container(
+                width=480,
+                content=ft.Column(
+                    tight=True,
+                    spacing=8,
+                    controls=[
+                        ft.Text(
+                            "Saved at:",
+                            size=12,
+                            color=ft.Colors.ON_SURFACE_VARIANT,
+                        ),
+                        ft.Text(
+                            str(file_path),
+                            size=11,
+                            selectable=True,
+                            no_wrap=False,
+                            color=ft.Colors.PRIMARY,
+                        ),
+                    ],
+                ),
+            ),
+            actions=[
+                ft.TextButton(
+                    "Copy path",
+                    icon=ft.Icons.CONTENT_COPY,
+                    on_click=_on_copy_path,
+                ),
+                ft.TextButton(
+                    "Show in folder",
+                    icon=ft.Icons.FOLDER_OPEN,
+                    on_click=_on_open_folder,
+                ),
+                ft.FilledButton(
+                    content="Open file",
+                    icon=ft.Icons.OPEN_IN_NEW,
+                    on_click=_on_open_file,
+                ),
+                ft.TextButton("Close", on_click=lambda _e: _close()),
+            ],
+        )
+        page.show_dialog(dialog)
+
+    def _show_snackbar(self, message: str) -> None:
+        """Best-effort SnackBar from the chat view (mid-render races OK)."""
+        try:
+            self._app_state.page.show_dialog(
+                ft.SnackBar(content=ft.Text(message, no_wrap=False), duration=4000)
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_tamper_click(self, event: ft.ControlEvent) -> None:
         """Arm the connection so the next incoming record fails MAC.
