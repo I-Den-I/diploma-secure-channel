@@ -896,56 +896,86 @@ class ChatView:
 
         On Android ``Path.home()`` resolves to ``/data`` (or worse,
         depending on the device), which the app cannot write to —
-        attempting to ``mkdir`` raises ``PermissionError`` (errno 13)
-        and aborts the file transfer. This resolver consults
-        ``page.storage_paths`` for a platform-appropriate location:
+        the previous behaviour bailed mid-transfer with
+        ``PermissionError`` (errno 13). This resolver mirrors the
+        public-key-export logic in :class:`gui.connection_view.ConnectionView`
+        so received files land **next to** the exported public keys
+        (``/storage/emulated/0/Download/<name>``) — the only spot every
+        stock file manager reliably exposes as "Downloads" on every
+        Android version. No ``DSTU_SecureChannel`` subfolder: the user
+        explicitly asked for files to land at the same path as the
+        exported public keys, not in a separate hidden tree.
 
-        1. Public Downloads (visible to file managers); cached in
-           ``app_state.download_directory`` on first success.
-        2. App documents directory ``DSTU_SecureChannel/received/`` —
-           always writable, used as the safe fallback.
-        3. Desktop: keeps the existing ``~/DSTU_SecureChannel/received/``.
+        Order of attempts:
 
-        The resolved path is cached on :attr:`AppState.download_directory`
-        so subsequent transfers reuse it without another roundtrip.
+        1. ``/storage/emulated/0/Download`` — the literal AOSP path.
+           Confirmed working everywhere we've tested; same target as
+           ``ConnectionView._try_save_to_public_downloads``. Each
+           candidate is probed with a ``touch`` + ``unlink`` write
+           test, so we never report success on a path that will then
+           500 on the actual file write.
+        2. ``StoragePaths.get_downloads_directory()`` — Flet's helper,
+           kept as a last-resort for iOS / unusual Android forks where
+           the AOSP path is missing.
+        3. App-private documents (``<docs>/DSTU_SecureChannel/received/``)
+           — guaranteed writable but invisible to file managers; used
+           only when both public locations fail.
+
+        The resolved path is cached on
+        :attr:`AppState.download_directory` so subsequent transfers
+        reuse it without another probe.
+
+        Desktop behaviour is unchanged (``~/DSTU_SecureChannel/received``)
+        so the existing smoke test keeps passing.
         """
         page = self._app_state.page
         is_mobile: bool = (
             getattr(page, "platform", None) in _MOBILE_PLATFORMS
         )
 
-        # Desktop default already pointed at home — keep it (test pins this
-        # behaviour and Path.home() is writable on every desktop OS).
+        # Desktop default already pointed at home — keep it (test pins
+        # this behaviour and Path.home() is writable on every desktop OS).
         if not is_mobile:
             current = self._app_state.download_directory
             current.mkdir(parents=True, exist_ok=True)
             return current
 
-        # Mobile: ignore the home-based default and resolve via Flet.
+        async def _attempt(target_dir: Path) -> bool:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                probe = target_dir / ".dstu_write_probe"
+                await asyncio.to_thread(probe.touch)
+                await asyncio.to_thread(probe.unlink)
+                return True
+            except OSError:
+                return False
+
+        # 1. AOSP public Downloads — same target as the public-key export.
+        candidate = Path("/storage/emulated/0/Download")
+        if await _attempt(candidate):
+            self._app_state.download_directory = candidate
+            return candidate
+
+        # 2. Flet's helper for iOS / unusual Android forks.
         try:
-            dl_str: Optional[str] = await page.storage_paths.get_downloads_directory()
+            dl_str: Optional[str] = (
+                await page.storage_paths.get_downloads_directory()
+            )
             if dl_str:
-                resolved = Path(dl_str) / "DSTU_SecureChannel"
-                resolved.mkdir(parents=True, exist_ok=True)
-                self._app_state.download_directory = resolved
-                return resolved
+                candidate = Path(dl_str)
+                if await _attempt(candidate):
+                    self._app_state.download_directory = candidate
+                    return candidate
         except Exception:  # noqa: BLE001 — API may be missing on this build
             pass
 
-        try:
-            target = Path("/storage/emulated/0/Download/DSTU_SecureChannel")
-            target.mkdir(parents=True, exist_ok=True)
-            self._app_state.download_directory = target
-            return target
-        except OSError:
-            pass
-
-        # Last resort: app-private documents directory.
+        # 3. Last-resort app-private documents — always writable but
+        # only visible via ADB / Files-app-with-show-system on Android.
         docs_str = await page.storage_paths.get_application_documents_directory()
-        resolved = Path(docs_str) / "DSTU_SecureChannel" / "received"
-        resolved.mkdir(parents=True, exist_ok=True)
-        self._app_state.download_directory = resolved
-        return resolved
+        fallback = Path(docs_str) / "DSTU_SecureChannel" / "received"
+        fallback.mkdir(parents=True, exist_ok=True)
+        self._app_state.download_directory = fallback
+        return fallback
 
     async def _cancel_background_receive_loop(self) -> None:
         """Cancel the background listener and wait for it to exit cleanly."""
