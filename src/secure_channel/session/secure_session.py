@@ -112,6 +112,17 @@ class SecureSession:
         """Largest sequence number successfully decrypted so far (-1 if none)."""
         return self._receiving_half.highest_accepted_sequence_number
 
+    @property
+    def incoming_peer_clock_offset_microseconds(self) -> int | None:
+        """Clock offset (peer minus local) learned from the first record.
+
+        ``None`` until the first incoming record has been decrypted.
+        Positive ⇒ the peer's wall clock runs ahead of the local one.
+        Surfaced so the application (the GUI's system-log panel) can
+        show the user the cross-peer clock skew the protocol absorbed.
+        """
+        return self._receiving_half.peer_clock_offset_microseconds
+
     def encrypt_outgoing_record(self, plaintext: bytes) -> bytes:
         """Wrap an application record into its encrypted on-wire form."""
         return self._sending_half.encrypt_record(plaintext)

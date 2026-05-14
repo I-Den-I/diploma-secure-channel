@@ -66,6 +66,8 @@ def _build_mock_secure_connection() -> object:
     fake_connection = MagicMock(spec=SecureChannelConnection)
     fake_session = MagicMock()
     fake_session.role.name = "initiator"
+    # No incoming record decrypted yet → peer-clock offset unknown.
+    fake_session.incoming_peer_clock_offset_microseconds = None
     fake_connection.secure_session = fake_session
     fake_connection.peer_address = ("127.0.0.1", 9000)
     return fake_connection
@@ -852,3 +854,68 @@ async def test_resolve_download_directory_skips_unwritable_aosp_path(
     # AOSP write-probe failed → resolver should have moved on to Flet's
     # get_downloads_directory(), which returned our tmp helper path.
     assert resolved == flet_helper_path
+
+
+# ---------------------------------------------------------------------------
+# Peer-clock offset surfacing in the chat view's system log
+# ---------------------------------------------------------------------------
+
+
+def test_format_clock_offset_renders_signed_human_readable() -> None:
+    """_format_clock_offset turns signed microseconds into "+58 min 13 s" etc."""
+    from gui.chat_view import ChatView
+
+    fmt = ChatView._format_clock_offset  # type: ignore[attr-defined]
+    assert fmt(0) == "+0 s"
+    assert fmt(13 * 1_000_000) == "+13 s"
+    assert fmt(-13 * 1_000_000) == "−13 s"  # note: U+2212 minus sign
+    assert fmt((58 * 60 + 13) * 1_000_000) == "+58 min 13 s"
+    assert fmt((60 * 60 + 2 * 60 + 5) * 1_000_000) == "+1 h 2 min 5 s"
+    # Sub-second offsets still render (seconds component never omitted).
+    assert fmt(500_000) == "+0 s"
+
+
+def test_log_peer_clock_offset_once_logs_exactly_once() -> None:
+    """The peer-clock offset is surfaced in the log on the first record only."""
+    from gui.chat_view import ChatView
+
+    state = AppState(page=_build_mock_page())
+    connection = _build_mock_secure_connection()
+    connection.secure_session.incoming_peer_clock_offset_microseconds = (  # type: ignore[attr-defined]
+        3493 * 1_000_000  # peer ~58 min ahead, the real-world report
+    )
+    state.secure_connection = connection  # type: ignore[assignment]
+
+    chat_view = ChatView(state)
+    chat_view.build()
+    entries_before = len(chat_view._system_log_entries)  # type: ignore[attr-defined]
+
+    chat_view._log_peer_clock_offset_once()  # type: ignore[attr-defined]
+    entries_after_first = len(chat_view._system_log_entries)  # type: ignore[attr-defined]
+    assert entries_after_first == entries_before + 1
+    logged_message: str = chat_view._system_log_entries[-1].message  # type: ignore[attr-defined]
+    assert "Peer clock offset anchored" in logged_message
+    assert "+58 min 13 s" in logged_message
+
+    # A second call must be a silent no-op — the offset is logged once.
+    chat_view._log_peer_clock_offset_once()  # type: ignore[attr-defined]
+    assert len(chat_view._system_log_entries) == entries_after_first  # type: ignore[attr-defined]
+
+
+def test_log_peer_clock_offset_once_is_noop_while_offset_unknown() -> None:
+    """Before any record is decrypted the offset is None → nothing is logged."""
+    from gui.chat_view import ChatView
+
+    state = AppState(page=_build_mock_page())
+    connection = _build_mock_secure_connection()
+    connection.secure_session.incoming_peer_clock_offset_microseconds = None  # type: ignore[attr-defined]
+    state.secure_connection = connection  # type: ignore[assignment]
+
+    chat_view = ChatView(state)
+    chat_view.build()
+    entries_before = len(chat_view._system_log_entries)  # type: ignore[attr-defined]
+
+    chat_view._log_peer_clock_offset_once()  # type: ignore[attr-defined]
+    assert len(chat_view._system_log_entries) == entries_before  # type: ignore[attr-defined]
+    # The "logged" guard must stay False so a later record can still log it.
+    assert chat_view._peer_clock_offset_logged is False  # type: ignore[attr-defined]

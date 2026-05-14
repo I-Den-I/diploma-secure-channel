@@ -51,6 +51,12 @@ from secure_channel.network.messages import (
     FileTransferBegin,
     TextMessage,
 )
+from secure_channel.session.records import (
+    FutureRecordDetected,
+    SequenceNumberOutOfWindow,
+    SequenceNumberReplayed,
+    StaleRecordDetected,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +158,7 @@ class ChatView:
         "_export_logs_button",
         "_chat_entries",
         "_system_log_entries",
+        "_peer_clock_offset_logged",
     )
 
     def __init__(self, app_state: AppState) -> None:
@@ -163,6 +170,10 @@ class ChatView:
         self._connection: Final[SecureChannelConnection] = app_state.secure_connection
         self._listener_task: Optional[asyncio.Task[None]] = None
         self._listener_running: bool = False
+        # The peer-clock offset is only known after the first incoming
+        # record has been decrypted; this guard makes sure we surface it
+        # in the system log exactly once, on that first record.
+        self._peer_clock_offset_logged: bool = False
 
         # In-memory entry caches let us re-render after theme changes.
         self._chat_entries: list[ChatEntry] = []
@@ -801,15 +812,49 @@ class ChatView:
                     )
                     self._append_chat_entry("system", "Peer disconnected.")
                     return
-                except AuthenticationFailed as authentication_error:
-                    # Surface the bad record both in the log AND as a
-                    # red-bubble chat entry so the user sees clearly
-                    # that the integrity check rejected the message.
-                    # This is the visible payoff of the Simulate-tamper
-                    # debug button.
+                except (StaleRecordDetected, FutureRecordDetected) as freshness_error:
+                    # NOT a tamper: the record authenticated fine but its
+                    # timestamp fell outside the peer-anchored freshness
+                    # window — almost always clock skew between the two
+                    # devices or a deliberately delayed delivery.
+                    self._append_system_log_entry(
+                        "warn",
+                        f"Freshness check failed (clock skew / delayed "
+                        f"delivery): {freshness_error}",
+                    )
+                    self._append_chat_entry(
+                        "peer",
+                        "Rejected: failed freshness check "
+                        "(clock skew or delayed record)",
+                        verified=False,
+                    )
+                    continue
+                except (
+                    SequenceNumberReplayed,
+                    SequenceNumberOutOfWindow,
+                ) as replay_error:
+                    # The record authenticated but its sequence number
+                    # was already seen (or is too old to track) — a
+                    # replay attack or a duplicated packet.
                     self._append_system_log_entry(
                         "error",
-                        f"Tampered record rejected: {authentication_error}",
+                        f"Replay attack rejected: {replay_error}",
+                    )
+                    self._append_chat_entry(
+                        "peer",
+                        "Rejected: replay detected "
+                        "(duplicate / out-of-window record)",
+                        verified=False,
+                    )
+                    continue
+                except AuthenticationFailed as authentication_error:
+                    # Genuine integrity failure: the AEAD tag or the
+                    # header-derived nonce did not verify — the record
+                    # was modified in transit. This is the visible
+                    # payoff of the Simulate-tamper debug button.
+                    self._append_system_log_entry(
+                        "error",
+                        f"Integrity check failed (MAC): {authentication_error}",
                     )
                     self._append_chat_entry(
                         "peer",
@@ -817,6 +862,8 @@ class ChatView:
                         verified=False,
                     )
                     continue
+
+                self._log_peer_clock_offset_once()
 
                 if isinstance(message, TextMessage):
                     self._append_chat_entry(
@@ -976,6 +1023,46 @@ class ChatView:
         fallback.mkdir(parents=True, exist_ok=True)
         self._app_state.download_directory = fallback
         return fallback
+
+    def _log_peer_clock_offset_once(self) -> None:
+        """Surface the peer-clock offset in the system log, exactly once.
+
+        After the first incoming record decrypts, the secure session
+        knows how far the peer's wall clock sits from the local one
+        (see :attr:`SecureSession.incoming_peer_clock_offset_microseconds`).
+        Logging it makes the cross-country clock-skew the protocol just
+        absorbed *visible* — handy for the diploma demo and for the
+        user wondering why "freshness" errors used to flood the log.
+        """
+        if self._peer_clock_offset_logged:
+            return
+        offset_microseconds: Optional[int] = (
+            self._connection.secure_session.incoming_peer_clock_offset_microseconds
+        )
+        if offset_microseconds is None:
+            return
+        self._peer_clock_offset_logged = True
+        self._append_system_log_entry(
+            "info",
+            f"Peer clock offset anchored: {self._format_clock_offset(offset_microseconds)} "
+            "(constant skew absorbed; freshness window now relative to the peer)",
+        )
+
+    @staticmethod
+    def _format_clock_offset(offset_microseconds: int) -> str:
+        """Render a signed microsecond clock offset as e.g. ``+58 min 13 s``."""
+        sign: str = "+" if offset_microseconds >= 0 else "−"
+        total_seconds: int = abs(offset_microseconds) // 1_000_000
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours} h")
+        if minutes:
+            parts.append(f"{minutes} min")
+        # Always show seconds so a sub-minute offset isn't rendered empty.
+        parts.append(f"{seconds} s")
+        return sign + " ".join(parts)
 
     async def _cancel_background_receive_loop(self) -> None:
         """Cancel the background listener and wait for it to exit cleanly."""
