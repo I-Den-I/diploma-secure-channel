@@ -21,9 +21,21 @@ implementation enforces.
 The 8-byte microsecond timestamp is included in the header (and therefore
 in the AEAD's associated data) for two purposes:
 
-* It defends against *delay attacks*: the receiver compares the embedded
-  timestamp against its local clock and rejects records whose
-  timestamps fall outside a configurable freshness window.
+* It defends against *delay attacks*: the receiver rejects records whose
+  timestamps fall outside a configurable freshness window. To stay
+  usable when the two peers' wall clocks are not NTP-synchronised --- a
+  routine situation when they sit in different countries or on mobile
+  devices --- the freshness check is **anchored to the peer's clock**
+  rather than to absolute local time. The first authentic record a
+  receiver decrypts establishes a one-off ``peer_clock_offset`` (the
+  signed difference ``peer_timestamp - local_now``); every subsequent
+  record is then validated against ``local_now + peer_clock_offset``.
+  A constant clock skew of *any* magnitude is therefore absorbed, while
+  a record delayed (or replayed stale) *after* the anchor is still
+  rejected because its timestamp lags the anchored "now". On the very
+  first record a genuine skew and a delay attack are information-
+  theoretically indistinguishable without an external time source, so
+  the AEAD-authenticated peer is trusted to set the anchor.
 * It binds each record to a specific time of issuance, which makes
   forensic analysis of recorded traffic straightforward.
 
@@ -70,9 +82,14 @@ _RECORD_HEADER_BYTE_LENGTH: Final[int] = (
 DEFAULT_TIMESTAMP_TOLERANCE_MICROSECONDS: Final[int] = 30 * 1_000_000
 """Default freshness window: ±30 seconds.
 
-Allows for modest clock skew between peers (NTP-synchronised hosts are
-typically within tens of milliseconds, but corporate VPNs and mobile
-networks can introduce noticeably larger drift).
+Since :class:`ReceivingHalf` anchors the freshness check to the peer's
+clock (see the module docstring), this tolerance no longer has to
+absorb the *absolute* offset between two unsynchronised wall clocks ---
+that is handled by the per-session ``peer_clock_offset``. What is left
+for the ±30 s window to cover is the comparatively tiny *relative*
+drift that accumulates between the two clocks during a single session
+plus ordinary network jitter. ±30 s is therefore a generous margin,
+not a tight one.
 """
 
 
@@ -254,7 +271,11 @@ class ReceivingHalf:
     incoming record:
 
     1. *AEAD authentication* via the underlying Kalyna-CMAC tag.
-    2. *Freshness* via timestamp comparison with the local clock.
+    2. *Freshness* via timestamp comparison, **anchored to the peer's
+       clock**: the first authentic record sets a one-off
+       ``peer_clock_offset`` and every later record is checked against
+       ``local_now + peer_clock_offset`` (see the module docstring for
+       the full rationale).
     3. *Anti-replay* via the sliding bitmap window.
 
     The checks are applied in the order: AEAD → timestamp → replay,
@@ -273,6 +294,7 @@ class ReceivingHalf:
         "_replay_window",
         "_clock",
         "_timestamp_tolerance_microseconds",
+        "_peer_clock_offset_microseconds",
     )
 
     def __init__(
@@ -291,6 +313,11 @@ class ReceivingHalf:
         self._timestamp_tolerance_microseconds: Final[int] = (
             effective_policy.timestamp_tolerance_microseconds
         )
+        # Signed difference ``peer_timestamp - local_now`` learned from
+        # the first authentic record; ``None`` until that record
+        # arrives. Once set it is never changed again for the lifetime
+        # of the session direction.
+        self._peer_clock_offset_microseconds: int | None = None
 
     @property
     def highest_accepted_sequence_number(self) -> int:
@@ -302,16 +329,34 @@ class ReceivingHalf:
         """Read-only access to the underlying sliding window for tests."""
         return self._replay_window
 
+    @property
+    def peer_clock_offset_microseconds(self) -> int | None:
+        """Clock offset (peer minus local) learned from the first record.
+
+        ``None`` until the first authentic record has been decrypted.
+        A positive value means the peer's wall clock runs ahead of the
+        local one; a negative value means it runs behind. Exposed for
+        diagnostics — the GUI surfaces it so the user can *see* the
+        protocol absorbing a cross-country clock skew.
+        """
+        return self._peer_clock_offset_microseconds
+
     def decrypt_record(self, wire_bytes: bytes) -> bytes:
         """Verify, decrypt and return the plaintext of a received record.
+
+        The very first authentic record only *bootstraps* the
+        peer-clock anchor and is exempt from the freshness window;
+        every record after it is freshness-checked relative to that
+        anchor (see :meth:`_bootstrap_or_enforce_freshness_window`).
 
         :raises AuthenticationFailed: If the AEAD tag does not verify or
             if the embedded nonce does not match the one derived from
             the header.
-        :raises StaleRecordDetected: If the record's timestamp is older
-            than the freshness window allows.
-        :raises FutureRecordDetected: If the record's timestamp lies
-            further in the future than the freshness window allows.
+        :raises StaleRecordDetected: If a *non-first* record's timestamp
+            is older than the anchored freshness window allows.
+        :raises FutureRecordDetected: If a *non-first* record's
+            timestamp lies further in the future than the anchored
+            freshness window allows.
         :raises SequenceNumberReplayed: If the record's sequence number
             has already been accepted within the sliding window.
         :raises SequenceNumberOutOfWindow: If the record's sequence
@@ -338,28 +383,56 @@ class ReceivingHalf:
                 "Decrypted payload length does not match the header field."
             )
 
-        self._enforce_freshness_window(timestamp_microseconds)
+        self._bootstrap_or_enforce_freshness_window(timestamp_microseconds)
         self._enforce_anti_replay(sequence_number)
         return plaintext
 
-    def _enforce_freshness_window(self, timestamp_microseconds: int) -> None:
-        """Reject records whose timestamps fall outside the freshness window."""
+    def _bootstrap_or_enforce_freshness_window(
+        self, timestamp_microseconds: int
+    ) -> None:
+        """Anchor to the peer's clock, then enforce the freshness window.
+
+        On the **first** authentic record this learns the one-off
+        ``peer_clock_offset`` and returns without rejecting anything ---
+        the AEAD-authenticated peer is trusted to set the time anchor,
+        and a constant skew of any magnitude (peers in different
+        countries / devices not NTP-synced) is absorbed here.
+
+        On **every subsequent** record the embedded timestamp is
+        compared against ``local_now + peer_clock_offset``: a record
+        that lags (stale / delayed replay) or races ahead (clock glitch)
+        by more than ``timestamp_tolerance_microseconds`` is rejected.
+        Because the comparison is relative to the anchor, the only thing
+        the tolerance has to cover is intra-session relative drift plus
+        network jitter --- not the absolute cross-peer offset.
+        """
         current_time_microseconds: int = self._clock()
-        lower_bound: int = (
-            current_time_microseconds - self._timestamp_tolerance_microseconds
+        if self._peer_clock_offset_microseconds is None:
+            # First authentic record — adopt the peer's clock as the
+            # trusted baseline. See the module docstring for why a
+            # first-record delay attack is out of scope here.
+            self._peer_clock_offset_microseconds = (
+                timestamp_microseconds - current_time_microseconds
+            )
+            return
+        anchored_now: int = (
+            current_time_microseconds + self._peer_clock_offset_microseconds
         )
-        upper_bound: int = (
-            current_time_microseconds + self._timestamp_tolerance_microseconds
-        )
+        lower_bound: int = anchored_now - self._timestamp_tolerance_microseconds
+        upper_bound: int = anchored_now + self._timestamp_tolerance_microseconds
         if timestamp_microseconds < lower_bound:
             raise StaleRecordDetected(
-                "Record timestamp predates the freshness window "
-                f"(record={timestamp_microseconds}, lower_bound={lower_bound})."
+                "Record timestamp predates the (peer-anchored) freshness "
+                f"window (record={timestamp_microseconds}, "
+                f"lower_bound={lower_bound}, "
+                f"peer_clock_offset={self._peer_clock_offset_microseconds})."
             )
         if timestamp_microseconds > upper_bound:
             raise FutureRecordDetected(
-                "Record timestamp lies beyond the freshness window "
-                f"(record={timestamp_microseconds}, upper_bound={upper_bound})."
+                "Record timestamp lies beyond the (peer-anchored) freshness "
+                f"window (record={timestamp_microseconds}, "
+                f"upper_bound={upper_bound}, "
+                f"peer_clock_offset={self._peer_clock_offset_microseconds})."
             )
 
     def _enforce_anti_replay(self, sequence_number: int) -> None:

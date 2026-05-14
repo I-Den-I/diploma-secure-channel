@@ -95,8 +95,19 @@ def _open_channel_with_clocks(
     initial_responder_microseconds: int = 1_700_000_000_000_000,
     timestamp_tolerance_microseconds: int = DEFAULT_TIMESTAMP_TOLERANCE_MICROSECONDS,
     replay_window_byte_size: int = 8,
+    synchronised_clocks: bool = True,
 ) -> _ChannelEndpoints:
-    """Run the full handshake with deterministic clocks on both sides."""
+    """Run the full handshake with deterministic clocks on both sides.
+
+    :param synchronised_clocks: When ``True`` (the default) each side
+        *receives* with the other side's *sending* clock, keeping the
+        two virtual clocks in perfect lockstep — ideal for replay /
+        timestamp tests where any skew would be noise. When ``False``
+        each side receives with its **own** clock, so the gap between
+        ``initial_initiator_microseconds`` and
+        ``initial_responder_microseconds`` becomes a genuine
+        cross-peer clock skew (used by the offset-anchoring tests).
+    """
     initiator_private_key, responder_private_key = _generate_long_term_credentials()
     initiator_credentials = _credentials_for(
         initiator_private_key, responder_private_key
@@ -108,13 +119,23 @@ def _open_channel_with_clocks(
     initiator_clock = _ManualMicrosecondClock(initial_initiator_microseconds)
     responder_clock = _ManualMicrosecondClock(initial_responder_microseconds)
 
+    if synchronised_clocks:
+        # Receiver consults the *sender's* clock → perfect lockstep.
+        initiator_receive_clock: _ManualMicrosecondClock = responder_clock
+        responder_receive_clock: _ManualMicrosecondClock = initiator_clock
+    else:
+        # Receiver consults its *own* clock → the initial gap between
+        # the two clocks is a real, observable cross-peer skew.
+        initiator_receive_clock = initiator_clock
+        responder_receive_clock = responder_clock
+
     initiator_freshness_policy = FreshnessPolicy(
-        clock=responder_clock,  # the initiator's *receiving* clock matches the responder's send clock for symmetry of the test
+        clock=initiator_receive_clock,
         timestamp_tolerance_microseconds=timestamp_tolerance_microseconds,
         replay_window_byte_size=replay_window_byte_size,
     )
     responder_freshness_policy = FreshnessPolicy(
-        clock=initiator_clock,  # responder *receives* using the initiator's clock to keep the two virtual clocks in lockstep for test reproducibility
+        clock=responder_receive_clock,
         timestamp_tolerance_microseconds=timestamp_tolerance_microseconds,
         replay_window_byte_size=replay_window_byte_size,
     )
@@ -224,10 +245,20 @@ def test_replay_of_out_of_order_accepted_record_is_rejected() -> None:
 
 
 def test_record_with_expired_timestamp_is_rejected() -> None:
-    """A record stored by the attacker for hours and replayed must be rejected."""
+    """A record stored by the attacker for hours and replayed must be rejected.
+
+    The freshness window is anchored by the *first* authentic record, so
+    a priming record is decrypted first to establish the peer-clock
+    anchor; the stale-replay scenario is then exercised on a later
+    record, which is where it matters in practice.
+    """
     endpoints = _open_channel_with_clocks(
         timestamp_tolerance_microseconds=5 * 1_000_000  # ±5 seconds tolerance
     )
+    # Prime the peer-clock anchor with one legitimate record.
+    priming: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"priming")
+    endpoints.responder_session.decrypt_incoming_record(priming)
+
     sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"old")
 
     # Attacker delays delivery by 1 hour --- well past the freshness window.
@@ -238,22 +269,27 @@ def test_record_with_expired_timestamp_is_rejected() -> None:
 
 
 def test_record_with_future_timestamp_is_rejected() -> None:
-    """A record whose timestamp lies far in the future must be rejected.
+    """A record whose timestamp races far ahead of the anchor must be rejected.
 
-    This simulates either a malicious sender or a desynchronised peer
-    whose clock is grossly ahead.
+    With peer-clock anchoring a *constant* skew is absorbed, so the
+    scenario here is a record whose timestamp jumps far beyond the
+    anchored "now" — a clock glitch or a malicious sender — exercised
+    on a record that follows the anchor-establishing priming record.
     """
     endpoints = _open_channel_with_clocks(
         timestamp_tolerance_microseconds=5 * 1_000_000
     )
-    # The initiator side advances its sending clock by 1 hour before
-    # encrypting; the receiver's clock stays at the original time.
+    # Prime the peer-clock anchor with one legitimate record.
+    priming: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"priming")
+    endpoints.responder_session.decrypt_incoming_record(priming)
+
+    # The sender's clock jumps 1 hour ahead before stamping this record.
     endpoints.initiator_clock.advance_by(60 * 60 * 1_000_000)
     sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"future")
 
-    # Roll the initiator's clock back so the receiving side (which
-    # consults the initiator clock per test setup) sees an old "now"
-    # but a far-future record timestamp.
+    # Roll the sending clock back so the receiver (which consults that
+    # same clock in synchronised mode) sees an old "now" but a record
+    # timestamp an hour beyond the anchor.
     endpoints.initiator_clock.advance_by(-60 * 60 * 1_000_000)
 
     with pytest.raises(FutureRecordDetected):
@@ -266,6 +302,10 @@ def test_record_at_exact_freshness_boundary_is_accepted() -> None:
     endpoints = _open_channel_with_clocks(
         timestamp_tolerance_microseconds=tolerance
     )
+    # Prime the peer-clock anchor (offset becomes 0 in synchronised mode).
+    priming: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"priming")
+    endpoints.responder_session.decrypt_incoming_record(priming)
+
     sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"on-the-edge")
 
     # Advance by exactly the tolerance --- still inside the closed window.
@@ -280,6 +320,10 @@ def test_record_just_outside_freshness_boundary_is_rejected() -> None:
     endpoints = _open_channel_with_clocks(
         timestamp_tolerance_microseconds=tolerance
     )
+    # Prime the peer-clock anchor (offset becomes 0 in synchronised mode).
+    priming: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"priming")
+    endpoints.responder_session.decrypt_incoming_record(priming)
+
     sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"just-too-old")
     endpoints.initiator_clock.advance_by(tolerance + 1)
     with pytest.raises(StaleRecordDetected):
@@ -296,6 +340,120 @@ def test_modest_clock_skew_is_tolerated() -> None:
     sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"skew-ok")
     plaintext: bytes = endpoints.responder_session.decrypt_incoming_record(sealed)
     assert plaintext == b"skew-ok"
+
+
+# ---------------------------------------------------------------------------
+# Peer-clock anchoring: large constant skew must be absorbed, while delay
+# attacks *after* the anchor must still be rejected.
+# ---------------------------------------------------------------------------
+
+
+_ONE_HOUR_MICROSECONDS: int = 60 * 60 * 1_000_000
+
+
+def test_large_constant_clock_skew_is_absorbed() -> None:
+    """A peer whose clock is ~1 hour ahead must still be able to talk.
+
+    Real-world scenario reported from the field: the two peers are in
+    different countries on devices that are not NTP-synchronised. Before
+    the peer-clock-anchoring fix every record after the first was
+    rejected with :class:`FutureRecordDetected` because the embedded
+    timestamp lay an hour beyond the receiver's local "now". With the
+    fix the first record establishes a +1 h offset that every later
+    record is measured against.
+    """
+    endpoints = _open_channel_with_clocks(
+        initial_initiator_microseconds=1_700_000_000_000_000 + _ONE_HOUR_MICROSECONDS,
+        initial_responder_microseconds=1_700_000_000_000_000,
+        timestamp_tolerance_microseconds=5 * 1_000_000,
+        synchronised_clocks=False,  # genuine independent clocks
+    )
+    # The initiator's clock is a full hour ahead of the responder's.
+    for index in range(6):
+        sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(
+            f"msg-{index}".encode()
+        )
+        # Mimic real elapsed time: both wall clocks tick forward together.
+        endpoints.initiator_clock.advance_by(1_000_000)
+        endpoints.responder_clock.advance_by(1_000_000)
+        plaintext: bytes = endpoints.responder_session.decrypt_incoming_record(sealed)
+        assert plaintext == f"msg-{index}".encode()
+
+
+def test_first_record_bootstraps_peer_clock_offset() -> None:
+    """The receiver exposes the +1 h offset it learned from the first record."""
+    endpoints = _open_channel_with_clocks(
+        initial_initiator_microseconds=1_700_000_000_000_000 + _ONE_HOUR_MICROSECONDS,
+        initial_responder_microseconds=1_700_000_000_000_000,
+        synchronised_clocks=False,
+    )
+    # No record decrypted yet → offset is still unknown.
+    assert (
+        endpoints.responder_session.incoming_peer_clock_offset_microseconds is None
+    )
+
+    sealed: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"first")
+    endpoints.responder_session.decrypt_incoming_record(sealed)
+
+    offset = endpoints.responder_session.incoming_peer_clock_offset_microseconds
+    assert offset is not None
+    # The initiator started exactly one hour ahead of the responder.
+    assert offset == _ONE_HOUR_MICROSECONDS
+
+
+def test_delay_attack_after_offset_bootstrap_is_still_rejected() -> None:
+    """Peer-clock anchoring must not weaken delay-attack protection.
+
+    A record captured and replayed *after* the anchor is established
+    still lags the anchored "now" and must be rejected as stale ---
+    the offset only absorbs a *constant* skew, never an attacker's
+    artificial delay.
+    """
+    endpoints = _open_channel_with_clocks(
+        initial_initiator_microseconds=1_700_000_000_000_000 + _ONE_HOUR_MICROSECONDS,
+        initial_responder_microseconds=1_700_000_000_000_000,
+        timestamp_tolerance_microseconds=5 * 1_000_000,
+        synchronised_clocks=False,
+    )
+    # First record bootstraps the +1 h anchor.
+    priming: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"priming")
+    endpoints.responder_session.decrypt_incoming_record(priming)
+
+    # The attacker captures the next record and sits on it for a minute
+    # (only the *initiator's* clock advances — the captured record keeps
+    # its original, now-stale timestamp).
+    captured: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"captured")
+    endpoints.initiator_clock.advance_by(60 * 1_000_000)
+    endpoints.responder_clock.advance_by(60 * 1_000_000)
+
+    with pytest.raises(StaleRecordDetected):
+        endpoints.responder_session.decrypt_incoming_record(captured)
+
+
+def test_offset_anchor_is_fixed_after_the_first_record() -> None:
+    """A second record must not move the anchor set by the first one."""
+    endpoints = _open_channel_with_clocks(
+        initial_initiator_microseconds=1_700_000_000_000_000 + _ONE_HOUR_MICROSECONDS,
+        initial_responder_microseconds=1_700_000_000_000_000,
+        synchronised_clocks=False,
+    )
+    first: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"first")
+    endpoints.responder_session.decrypt_incoming_record(first)
+    anchored_offset = (
+        endpoints.responder_session.incoming_peer_clock_offset_microseconds
+    )
+
+    # Advance both clocks by the same amount and exchange another record.
+    endpoints.initiator_clock.advance_by(3 * 1_000_000)
+    endpoints.responder_clock.advance_by(3 * 1_000_000)
+    second: bytes = endpoints.initiator_session.encrypt_outgoing_record(b"second")
+    endpoints.responder_session.decrypt_incoming_record(second)
+
+    # The anchor learned from the first record is immutable.
+    assert (
+        endpoints.responder_session.incoming_peer_clock_offset_microseconds
+        == anchored_offset
+    )
 
 
 # ---------------------------------------------------------------------------
